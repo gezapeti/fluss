@@ -31,7 +31,11 @@ Verify downloaded JARs using the [verification instructions](/downloads#verifyin
 ## Supported Spark Versions
 | Fluss Connector Versions | Supported Spark Versions |
 |--------------------------|--------------------------|
-| $FLUSS_VERSION_SHORT$    | 3.4, 3.5                 |
+| $FLUSS_VERSION_SHORT$    | 3.4, 3.5, 4.1            |
+
+:::note
+Spark 4.x requires Scala 2.13. The Fluss connector for Spark 4.1 is built with Scala 2.13, while the connectors for Spark 3.x are built with Scala 2.12.
+:::
 
 
 ## Feature Support
@@ -62,16 +66,28 @@ Fluss supports Apache Spark's SQL API and Spark Structured Streaming.
 
 Spark runs on all UNIX-like environments, i.e., Linux, Mac OS X. You can download the binary release of Spark from the [Apache Spark Downloads](https://spark.apache.org/downloads.html) page, then extract the archive:
 
+For Spark 3.5:
 ```shell
 tar -xzf spark-3.5.7-bin-hadoop3.tgz
+```
+
+For Spark 4.1:
+```shell
+tar -xzf spark-4.1.1-bin-hadoop3.tgz
 ```
 
 - **Copy Fluss Spark Bundled Jar**
 
 Download the Fluss Spark connector JAR from the [Dependencies](#dependencies) section above and copy it to the `jars` directory of your Spark home.
 
+For Spark 3.5 (Scala 2.12):
 ```shell
 cp fluss-spark-3.5_2.12-$FLUSS_VERSION$.jar <SPARK_HOME>/jars/
+```
+
+For Spark 4.1 (Scala 2.13):
+```shell
+cp fluss-spark-4.1_2.13-$FLUSS_VERSION$.jar <SPARK_HOME>/jars/
 ```
 
 - **Start Spark SQL**
