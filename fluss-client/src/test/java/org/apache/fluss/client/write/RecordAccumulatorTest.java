@@ -310,6 +310,33 @@ class RecordAccumulatorTest {
     }
 
     @Test
+    void testAppendRollsNewBatchWhenSchemaIdChanges() throws Exception {
+        int batchSize = 1024;
+        IndexedRow row = indexedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
+        RecordAccumulator accum = createTestRecordAccumulator(batchSize, 10L * batchSize);
+        int oldSchemaId = DATA1_TABLE_INFO.getSchemaId();
+        int newSchemaId = oldSchemaId + 1;
+
+        accum.append(createRecord(row), writeCallback, cluster, 0, false);
+        // a record with a bumped schema id closes the old-schema batch and rolls a new one.
+        accum.append(
+                createRecord(row, withSchemaId(newSchemaId)), writeCallback, cluster, 0, false);
+
+        Deque<WriteBatch> writeBatches =
+                accum.getReadyDeque(DATA1_PHYSICAL_TABLE_PATH, tb1.getBucket());
+        assertThat(writeBatches).hasSize(2);
+        Iterator<WriteBatch> batchIterator = writeBatches.iterator();
+        WriteBatch oldBatch = batchIterator.next();
+        assertThat(oldBatch.isClosed()).isTrue();
+        assertThat(oldBatch.schemaId()).isEqualTo(oldSchemaId);
+        assertThat(oldBatch.getRecordCount()).isEqualTo(1);
+        WriteBatch newBatch = batchIterator.next();
+        assertThat(newBatch.isClosed()).isFalse();
+        assertThat(newBatch.schemaId()).isEqualTo(newSchemaId);
+        assertThat(newBatch.getRecordCount()).isEqualTo(1);
+    }
+
+    @Test
     void testAppendLarge() throws Exception {
         int batchSize = 100;
         // set batch timeout as 0 to make sure batch are always ready.
@@ -550,7 +577,28 @@ class RecordAccumulatorTest {
      * format , see {@link #updateCluster(List)}.
      */
     private WriteRecord createRecord(IndexedRow row) {
-        return WriteRecord.forIndexedAppend(DATA1_TABLE_INFO, DATA1_PHYSICAL_TABLE_PATH, row, null);
+        return createRecord(row, DATA1_TABLE_INFO);
+    }
+
+    private WriteRecord createRecord(IndexedRow row, TableInfo tableInfo) {
+        return WriteRecord.forIndexedAppend(tableInfo, DATA1_PHYSICAL_TABLE_PATH, row, null);
+    }
+
+    private TableInfo withSchemaId(int schemaId) {
+        return new TableInfo(
+                DATA1_TABLE_INFO.getTablePath(),
+                DATA1_TABLE_INFO.getTableId(),
+                schemaId,
+                DATA1_TABLE_INFO.getSchema(),
+                DATA1_TABLE_INFO.getBucketKeys(),
+                DATA1_TABLE_INFO.getPartitionKeys(),
+                DATA1_TABLE_INFO.getNumBuckets(),
+                DATA1_TABLE_INFO.getProperties(),
+                DATA1_TABLE_INFO.getCustomProperties(),
+                DATA1_TABLE_INFO.getRemoteDataDir(),
+                DATA1_TABLE_INFO.getComment().orElse(null),
+                DATA1_TABLE_INFO.getCreatedTime(),
+                DATA1_TABLE_INFO.getModifiedTime());
     }
 
     private Cluster updateCluster(List<BucketLocation> bucketLocations) {
@@ -671,6 +719,8 @@ class RecordAccumulatorTest {
         conf.set(ConfigOptions.CLIENT_WRITER_BUFFER_MEMORY_SIZE, new MemorySize(totalSize));
         conf.set(ConfigOptions.CLIENT_WRITER_BUFFER_PAGE_SIZE, new MemorySize(pageSize));
         conf.set(ConfigOptions.CLIENT_WRITER_BATCH_SIZE, new MemorySize(batchSize));
+        // Use a small max throttle to keep test latencies tight; quadratic curve applies.
+        conf.set(ConfigOptions.CLIENT_WRITER_KV_BACKPRESSURE_MAX_THROTTLE, Duration.ofMillis(1000));
         return new RecordAccumulator(
                 conf,
                 new IdempotenceManager(
@@ -700,5 +750,97 @@ class RecordAccumulatorTest {
         return (bucketBatches1 == null ? 0 : bucketBatches1.size())
                 + (bucketBatches2 == null ? 0 : bucketBatches2.size())
                 + (bucketBatches3 == null ? 0 : bucketBatches3.size());
+    }
+
+    // ---- Backpressure throttle tests ----
+
+    @Test
+    void testIsThrottledReturnsFalseWhenNoThrottle() {
+        RecordAccumulator accum = createTestRecordAccumulator(1024, Integer.MAX_VALUE);
+        assertThat(accum.isThrottled(tb1)).isFalse();
+    }
+
+    @Test
+    void testUpdateThrottleWithPositivePressure() {
+        RecordAccumulator accum = createTestRecordAccumulator(1024, Integer.MAX_VALUE);
+        // pressure = 0.5 -> delay = 1000 * 0.5^2 = 250ms
+        accum.updateThrottle(tb1, 0.5f);
+        assertThat(accum.isThrottled(tb1)).isTrue();
+
+        // Advance time past the throttle
+        clock.advanceTime(Duration.ofMillis(251));
+        assertThat(accum.isThrottled(tb1)).isFalse();
+    }
+
+    @Test
+    void testUpdateThrottleWithHighPressure() {
+        RecordAccumulator accum = createTestRecordAccumulator(1024, Integer.MAX_VALUE);
+        // pressure = 0.9 -> delay = 1000 * 0.9^2 = 810ms
+        accum.updateThrottle(tb1, 0.9f);
+        assertThat(accum.isThrottled(tb1)).isTrue();
+
+        clock.advanceTime(Duration.ofMillis(500));
+        assertThat(accum.isThrottled(tb1)).isTrue();
+
+        clock.advanceTime(Duration.ofMillis(311));
+        assertThat(accum.isThrottled(tb1)).isFalse();
+    }
+
+    @Test
+    void testUpdateThrottleWithFullPressure() {
+        RecordAccumulator accum = createTestRecordAccumulator(1024, Integer.MAX_VALUE);
+        // Full pressure (internal hard-rejection value): stalls the bucket for the full max
+        // throttle window.
+        accum.updateThrottle(tb1, 1.0f);
+        assertThat(accum.isThrottled(tb1)).isTrue();
+
+        // Still throttled within the configured max throttle window.
+        clock.advanceTime(Duration.ofMillis(999));
+        assertThat(accum.isThrottled(tb1)).isTrue();
+
+        // Released exactly when the window elapses.
+        clock.advanceTime(Duration.ofMillis(2));
+        assertThat(accum.isThrottled(tb1)).isFalse();
+    }
+
+    @Test
+    void testUpdateThrottleRecovery() {
+        RecordAccumulator accum = createTestRecordAccumulator(1024, Integer.MAX_VALUE);
+        // First apply pressure
+        accum.updateThrottle(tb1, 0.5f);
+        assertThat(accum.isThrottled(tb1)).isTrue();
+
+        // Then recover with pressure=0
+        accum.updateThrottle(tb1, 0f);
+        assertThat(accum.isThrottled(tb1)).isFalse();
+    }
+
+    @Test
+    void testThrottledBucketSkippedInDrain() throws Exception {
+        IndexedRow row = indexedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
+        long batchSize = getTestBatchSize(row);
+        RecordAccumulator accum = createTestRecordAccumulator((int) batchSize, Integer.MAX_VALUE);
+        cluster = updateCluster(Arrays.asList(bucket1, bucket2, bucket3));
+
+        // Append records to tb1 and tb2. Both tb1 and tb2 lead on node1, so draining node1
+        // should only return tb2 when tb1 is throttled.
+        accum.append(createRecord(row), writeCallback, cluster, 0, false);
+        accum.append(createRecord(row), writeCallback, cluster, 1, false);
+
+        // Throttle tb1
+        accum.updateThrottle(tb1, 0.5f);
+
+        // Drain should only produce batches for tb2 (tb1 is throttled)
+        Map<Integer, List<ReadyWriteBatch>> batches =
+                accum.drain(
+                        cluster,
+                        new HashSet<>(Collections.singletonList(node1.id())),
+                        Integer.MAX_VALUE);
+        // tb2 should be in the batches, tb1 should not
+        List<ReadyWriteBatch> node1Batches = batches.get(node1.id());
+        assertThat(node1Batches)
+                .isNotNull()
+                .extracting(ReadyWriteBatch::tableBucket)
+                .containsExactly(tb2);
     }
 }

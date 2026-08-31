@@ -32,7 +32,9 @@ import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
+import org.apache.fluss.testutils.common.MultiVersionTest;
 
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.EnvironmentSettings;
@@ -43,6 +45,7 @@ import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.table.catalog.Catalog;
 import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogDatabase;
+import org.apache.flink.table.catalog.CatalogPartitionSpec;
 import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.table.catalog.exceptions.CatalogException;
@@ -158,6 +161,7 @@ abstract class FlinkCatalogITCase {
     }
 
     @Test
+    @MultiVersionTest
     void testCreateTable() throws Exception {
         // create a table will all supported data types
         tEnv.executeSql(
@@ -755,7 +759,9 @@ abstract class FlinkCatalogITCase {
             expectedTableProperties.put("table.replication.factor", "1");
             expectedTableProperties.put(
                     "table.kv.format-version", String.valueOf(CURRENT_KV_FORMAT_VERSION));
-            expectedTableProperties.put("table.kv.standby-replica.enabled", "true");
+            expectedTableProperties.put(
+                    ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
+                    String.valueOf(KvValueLayout.PLAIN.version()));
             assertThat(tableInfo.getProperties().toMap()).isEqualTo(expectedTableProperties);
 
             Map<String, String> expectedCustomProperties = new HashMap<>();
@@ -771,6 +777,75 @@ abstract class FlinkCatalogITCase {
             assertThat(tableInfo.getCustomProperties().toMap()).isEqualTo(expectedCustomProperties);
             assertThat(tableInfo.getNumBuckets()).isEqualTo(2);
         }
+    }
+
+    @Test
+    void testAlterTableWatermark() throws Exception {
+        String tableName = "test_watermark_table";
+        ObjectPath tablePath = new ObjectPath(DEFAULT_DB, tableName);
+
+        // 1. create table without watermark
+        tEnv.executeSql(
+                String.format(
+                        "CREATE TABLE %s ("
+                                + "  id BIGINT,"
+                                + "  ts TIMESTAMP(3),"
+                                + "  PRIMARY KEY (id) NOT ENFORCED"
+                                + ")",
+                        tableName));
+
+        CatalogTable table = (CatalogTable) catalog.getTable(tablePath);
+        assertThat(table.getUnresolvedSchema().getWatermarkSpecs()).isEmpty();
+
+        // 2. add watermark
+        tEnv.executeSql(
+                String.format(
+                        "ALTER TABLE %s ADD WATERMARK FOR ts AS ts - INTERVAL '10' SECOND",
+                        tableName));
+
+        table = (CatalogTable) catalog.getTable(tablePath);
+        List<Schema.UnresolvedWatermarkSpec> watermarks =
+                table.getUnresolvedSchema().getWatermarkSpecs();
+        assertThat(watermarks).hasSize(1);
+        assertThat(watermarks.get(0).getColumnName()).isEqualTo("ts");
+        assertThat(watermarks.get(0).getWatermarkExpression().asSummaryString())
+                .contains("INTERVAL '10' SECOND");
+
+        // 3. modify watermark
+        tEnv.executeSql(
+                String.format(
+                        "ALTER TABLE %s MODIFY WATERMARK FOR ts AS ts - INTERVAL '5' SECOND",
+                        tableName));
+
+        table = (CatalogTable) catalog.getTable(tablePath);
+        watermarks = table.getUnresolvedSchema().getWatermarkSpecs();
+        assertThat(watermarks).hasSize(1);
+        assertThat(watermarks.get(0).getColumnName()).isEqualTo("ts");
+        String modifySummary = watermarks.get(0).getWatermarkExpression().asSummaryString();
+        assertThat(modifySummary)
+                .contains("INTERVAL '5' SECOND")
+                .doesNotContain("INTERVAL '10' SECOND");
+
+        // 4. drop watermark
+        tEnv.executeSql(String.format("ALTER TABLE %s DROP WATERMARK", tableName));
+
+        table = (CatalogTable) catalog.getTable(tablePath);
+        assertThat(table.getUnresolvedSchema().getWatermarkSpecs()).isEmpty();
+
+        // 5. add watermark again and verify persistence
+        tEnv.executeSql(
+                String.format(
+                        "ALTER TABLE %s ADD WATERMARK FOR ts AS ts - INTERVAL '15' SECOND",
+                        tableName));
+
+        CatalogTable reloadedTable = (CatalogTable) catalog.getTable(tablePath);
+        List<Schema.UnresolvedWatermarkSpec> reloadedWatermarks =
+                reloadedTable.getUnresolvedSchema().getWatermarkSpecs();
+
+        assertThat(reloadedWatermarks).hasSize(1);
+        assertThat(reloadedWatermarks.get(0).getColumnName()).isEqualTo("ts");
+        assertThat(reloadedWatermarks.get(0).getWatermarkExpression().asSummaryString())
+                .contains("INTERVAL '15' SECOND");
     }
 
     @Test
@@ -1004,6 +1079,17 @@ abstract class FlinkCatalogITCase {
     }
 
     @Test
+    void testBitmapFunctionFailsForFullyQualifiedNonexistentDatabase() {
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "SELECT "
+                                                + CATALOG_NAME
+                                                + ".nonexistent_db.rb_build(ARRAY[1,2])"))
+                .hasMessageContaining("No match found for function signature");
+    }
+
+    @Test
     void testCreateCatalogWithLakeProperties() throws Exception {
         Map<String, String> properties = new HashMap<>();
         properties.put("paimon.jdbc.password", "pass");
@@ -1086,6 +1172,31 @@ abstract class FlinkCatalogITCase {
     }
 
     @Test
+    void testListPartitionsOnChangelogVirtualTableForPlannerStats() throws Exception {
+        // Flink's planner asks Catalog#listPartitions(ObjectPath) when recomputing statistics for
+        // partitioned tables. For a $changelog virtual table, the catalog should transparently list
+        // the base table's partitions instead of looking up a physical table named
+        // '<base>$changelog'.
+        tEnv.executeSql(
+                "CREATE TABLE partitioned_changelog_for_stats ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  region STRING NOT NULL,"
+                        + "  PRIMARY KEY (id, region) NOT ENFORCED"
+                        + ") PARTITIONED BY (region) "
+                        + "WITH ('bucket.num' = '1')");
+
+        ObjectPath basePath = new ObjectPath(DEFAULT_DB, "partitioned_changelog_for_stats");
+        CatalogPartitionSpec partitionSpec =
+                new CatalogPartitionSpec(Collections.singletonMap("region", "us"));
+        catalog.createPartition(basePath, partitionSpec, null, false);
+
+        ObjectPath changelogPath =
+                new ObjectPath(DEFAULT_DB, "partitioned_changelog_for_stats$changelog");
+        assertThat(catalog.listPartitions(changelogPath)).containsExactly(partitionSpec);
+    }
+
+    @Test
     void testGetBinlogVirtualTable() throws Exception {
         // Create a primary key table with partition
         tEnv.executeSql(
@@ -1146,7 +1257,7 @@ abstract class FlinkCatalogITCase {
         actualOptions.remove(ConfigOptions.BOOTSTRAP_SERVERS.key());
         actualOptions.remove(ConfigOptions.TABLE_REPLICATION_FACTOR.key());
         actualOptions.remove(ConfigOptions.TABLE_KV_FORMAT_VERSION.key());
-        actualOptions.remove(ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key());
+        actualOptions.remove(ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key());
         assertThat(actualOptions).isEqualTo(expectedOptions);
     }
 }

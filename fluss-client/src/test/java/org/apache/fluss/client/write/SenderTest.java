@@ -24,6 +24,9 @@ import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
+import org.apache.fluss.exception.AuthorizationException;
+import org.apache.fluss.exception.NetworkException;
+import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TimeoutException;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -39,6 +42,7 @@ import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.messages.ApiMessage;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
+import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.tablet.TestTabletServerGateway;
@@ -60,10 +64,10 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
-import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_INFO;
@@ -508,12 +512,14 @@ final class SenderTest {
                     assertThat(idempotenceManager.hasInflightBatches(tb1)).isFalse();
                     assertThat(
                                     accumulator.getReadyDeque(
-                                            DATA1_PHYSICAL_TABLE_PATH, tb1.getBucket()))
+                                            PhysicalTablePath.of(DATA1_TABLE_PATH),
+                                            tb1.getBucket()))
                             .hasSize(1);
                     assertThat(
                                     accumulator
                                             .getReadyDeque(
-                                                    DATA1_PHYSICAL_TABLE_PATH, tb1.getBucket())
+                                                    PhysicalTablePath.of(DATA1_TABLE_PATH),
+                                                    tb1.getBucket())
                                             .peek()
                                             .batchSequence())
                             .isEqualTo(0);
@@ -559,7 +565,7 @@ final class SenderTest {
 
         sender1.runOnce(); // receive response 1.
         Deque<WriteBatch> queuedBatches =
-                accumulator.getReadyDeque(DATA1_PHYSICAL_TABLE_PATH, tb1.getBucket());
+                accumulator.getReadyDeque(PhysicalTablePath.of(DATA1_TABLE_PATH), tb1.getBucket());
 
         // Make sure that we are queueing the second batch first.
         assertThat(queuedBatches.size()).isEqualTo(1);
@@ -629,7 +635,7 @@ final class SenderTest {
         assertThat(future2.get()).isNull();
         assertThat(future1.isDone()).isFalse();
         Deque<WriteBatch> queuedBatches =
-                accumulator.getReadyDeque(DATA1_PHYSICAL_TABLE_PATH, tb1.getBucket());
+                accumulator.getReadyDeque(PhysicalTablePath.of(DATA1_TABLE_PATH), tb1.getBucket());
 
         assertThat(queuedBatches.size()).isEqualTo(0);
         assertThat(idempotenceManager.lastAckedBatchSequence(tb1)).isEqualTo(Optional.of(1));
@@ -747,6 +753,144 @@ final class SenderTest {
         assertThat(sender1.numOfInFlightBatches(tb1)).isEqualTo(0);
     }
 
+    /**
+     * A late (reordered) out-of-order response must be retried, not treated as fatal, when the
+     * acked sequence has advanced while the batch was in flight.
+     *
+     * <p>Scenario: seq0 and seq1 are both in flight (each sent when {@code lastAcked=-1}). Response
+     * reordering delivers seq0's success first, advancing {@code lastAcked} to 0. seq1's
+     * out-of-order response then arrives late; it reflects a superseded server state. Since seq1
+     * was sent when {@code lastAcked=-1}, which is now behind the current {@code lastAcked=0}, the
+     * writer must retry seq1 instead of resetting.
+     */
+    @Test
+    void testStaleOutOfOrderResponseIsRetriedInsteadOfResettingWriter() throws Exception {
+        IdempotenceManager idempotenceManager = createIdempotenceManager(true);
+        Sender sender1 = setupWithIdempotenceState(idempotenceManager);
+        sender1.runOnce();
+        assertThat(idempotenceManager.isWriterIdValid()).isTrue();
+        long writerId = idempotenceManager.writerId();
+
+        // Send seq0 and seq1; both are sent while lastAcked is not present (-1).
+        CompletableFuture<Exception> future0 = new CompletableFuture<>();
+        appendToAccumulator(tb1, row(1, "a"), (tb, leo, e) -> future0.complete(e));
+        sender1.runOnce();
+        CompletableFuture<Exception> future1 = new CompletableFuture<>();
+        appendToAccumulator(tb1, row(2, "b"), (tb, leo, e) -> future1.complete(e));
+        sender1.runOnce();
+        assertThat(idempotenceManager.nextSequence(tb1)).isEqualTo(2);
+        assertThat(idempotenceManager.lastAckedBatchSequence(tb1)).isNotPresent();
+
+        // Reordered responses: seq0 succeeds first, advancing lastAcked to 0.
+        finishIdempotentProduceLogRequest(0, tb1, 0, createProduceLogResponse(tb1, 0L, 1L));
+        sender1.runOnce();
+        assertThat(future0.get()).isNull();
+        assertThat(idempotenceManager.lastAckedBatchSequence(tb1)).isEqualTo(Optional.of(0));
+
+        // seq1's out-of-order response arrives late. It is stale (seq1 was sent at lastAcked=-1,
+        // now behind lastAcked=0), so the writer must retry it, not reset.
+        finishIdempotentProduceLogRequest(
+                1, tb1, 0, createProduceLogResponse(tb1, Errors.OUT_OF_ORDER_SEQUENCE_EXCEPTION));
+        sender1.runOnce();
+        assertThat(idempotenceManager.isWriterIdValid()).isTrue();
+        assertThat(idempotenceManager.writerId()).isEqualTo(writerId);
+        assertThat(future1.isDone()).isFalse();
+
+        // The retried seq1 succeeds once the server observes the advanced state.
+        sender1.runOnce();
+        finishIdempotentProduceLogRequest(1, tb1, 0, createProduceLogResponse(tb1, 1L, 2L));
+        sender1.runOnce();
+        assertThat(future1.get()).isNull();
+        assertThat(idempotenceManager.lastAckedBatchSequence(tb1)).isEqualTo(Optional.of(1));
+    }
+
+    /**
+     * A genuine out-of-order response (no progress since the batch was sent) must still reset the
+     * writer.
+     *
+     * <p>Scenario: seq0 is acknowledged so {@code lastAcked=0}. seq1 is then sent while {@code
+     * lastAcked=0} (no in-flight predecessor). seq1 gets an out-of-order response with no
+     * advancement since it was sent, indicating an unrecoverable regression, so the writer resets.
+     */
+    @Test
+    void testGenuineOutOfOrderResponseResetsWriter() throws Exception {
+        IdempotenceManager idempotenceManager = createIdempotenceManager(true);
+        Sender sender1 = setupWithIdempotenceState(idempotenceManager);
+        sender1.runOnce();
+        assertThat(idempotenceManager.isWriterIdValid()).isTrue();
+
+        // Establish lastAcked = 0.
+        CompletableFuture<Exception> future0 = new CompletableFuture<>();
+        appendToAccumulator(tb1, row(1, "a"), (tb, leo, e) -> future0.complete(e));
+        sender1.runOnce();
+        finishIdempotentProduceLogRequest(0, tb1, 0, createProduceLogResponse(tb1, 0L, 1L));
+        sender1.runOnce();
+        assertThat(future0.get()).isNull();
+        assertThat(idempotenceManager.lastAckedBatchSequence(tb1)).isEqualTo(Optional.of(0));
+
+        // Send seq1 while lastAcked is already 0 (no in-flight predecessor).
+        CompletableFuture<Exception> future1 = new CompletableFuture<>();
+        appendToAccumulator(tb1, row(2, "b"), (tb, leo, e) -> future1.complete(e));
+        sender1.runOnce();
+
+        // seq1 gets an out-of-order response with no progress since it was sent: genuine
+        // regression -> the writer is reset. Do not run the sender again before asserting, since
+        // the next iteration would re-initialize a fresh writer id.
+        finishIdempotentProduceLogRequest(
+                1, tb1, 0, createProduceLogResponse(tb1, Errors.OUT_OF_ORDER_SEQUENCE_EXCEPTION));
+        assertThat(future1.get()).isInstanceOf(OutOfOrderSequenceException.class);
+        assertThat(idempotenceManager.isWriterIdValid()).isFalse();
+    }
+
+    /**
+     * The send-time acked-sequence snapshot must be refreshed on every send attempt: after a stale
+     * out-of-order response is retried, a subsequent out-of-order response with no new
+     * acknowledgement in between must reset the writer (it is no longer stale). This guards against
+     * regressing the snapshot to a capture-once semantic.
+     *
+     * <p>Scenario: seq0 and seq1 are in flight (each sent at {@code lastAcked=-1}). seq0 succeeds
+     * ({@code lastAcked=0}). seq1's first (stale) out-of-order response is retried and the resend
+     * refreshes seq1's snapshot to 0. A second out-of-order response for seq1, with no new ack,
+     * then finds {@code 0 > 0} false and resets the writer.
+     */
+    @Test
+    void testSendTimeSnapshotIsRefreshedOnRetrySoRepeatedOutOfOrderResets() throws Exception {
+        IdempotenceManager idempotenceManager = createIdempotenceManager(true);
+        Sender sender1 = setupWithIdempotenceState(idempotenceManager);
+        sender1.runOnce();
+        assertThat(idempotenceManager.isWriterIdValid()).isTrue();
+        long writerId = idempotenceManager.writerId();
+
+        // Send seq0 and seq1; both are sent while lastAcked is not present (-1).
+        CompletableFuture<Exception> future0 = new CompletableFuture<>();
+        appendToAccumulator(tb1, row(1, "a"), (tb, leo, e) -> future0.complete(e));
+        sender1.runOnce();
+        CompletableFuture<Exception> future1 = new CompletableFuture<>();
+        appendToAccumulator(tb1, row(2, "b"), (tb, leo, e) -> future1.complete(e));
+        sender1.runOnce();
+
+        // seq0 succeeds first, advancing lastAcked to 0.
+        finishIdempotentProduceLogRequest(0, tb1, 0, createProduceLogResponse(tb1, 0L, 1L));
+        sender1.runOnce();
+        assertThat(idempotenceManager.lastAckedBatchSequence(tb1)).isEqualTo(Optional.of(0));
+
+        // First (stale) seq1 out-of-order: sent at lastAcked=-1 < current 0 -> retried, writer
+        // kept. The following runOnce resends seq1, refreshing its send-time snapshot to 0.
+        finishIdempotentProduceLogRequest(
+                1, tb1, 0, createProduceLogResponse(tb1, Errors.OUT_OF_ORDER_SEQUENCE_EXCEPTION));
+        sender1.runOnce();
+        assertThat(idempotenceManager.isWriterIdValid()).isTrue();
+        assertThat(idempotenceManager.writerId()).isEqualTo(writerId);
+        assertThat(future1.isDone()).isFalse();
+
+        // Second seq1 out-of-order with no new ack: the refreshed snapshot is now 0, so the
+        // response is no longer stale (0 > 0 is false) and the writer is reset.
+        finishIdempotentProduceLogRequest(
+                1, tb1, 0, createProduceLogResponse(tb1, Errors.OUT_OF_ORDER_SEQUENCE_EXCEPTION));
+        assertThat(future1.get()).isInstanceOf(OutOfOrderSequenceException.class);
+        assertThat(idempotenceManager.isWriterIdValid()).isFalse();
+    }
+
     @Test
     void testCorrectHandlingOfDuplicateSequenceError() throws Exception {
         IdempotenceManager idempotenceManager = createIdempotenceManager(true);
@@ -852,6 +996,52 @@ final class SenderTest {
     }
 
     @Test
+    void testProduceLogRpcFailureOnlyFailsOwnedTableBatches() throws Exception {
+        TablePath secondTablePath = TablePath.of("test_db_2", "test_log_table_2");
+        TableInfo secondTableInfo =
+                TableInfo.of(
+                        secondTablePath,
+                        DATA2_TABLE_ID,
+                        1,
+                        DATA1_TABLE_DESCRIPTOR,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis());
+        resetTableInfosWith(secondTableInfo);
+
+        TableBucket secondTableBucket = new TableBucket(DATA2_TABLE_ID, 0);
+        CompletableFuture<Exception> firstFuture = new CompletableFuture<>();
+        CompletableFuture<Exception> secondFuture = new CompletableFuture<>();
+        appendToAccumulator(tb1, row(1, "a"), (tb, leo, e) -> firstFuture.complete(e));
+        appendToAccumulator(
+                secondTableInfo,
+                secondTableBucket,
+                row(2, "b"),
+                (tb, leo, e) -> secondFuture.complete(e));
+
+        sender.runOnce();
+        assertThat(pendingWriteRequestTableIds(tb1))
+                .containsExactlyInAnyOrder(DATA1_TABLE_ID, DATA2_TABLE_ID);
+
+        failRequest(
+                tb1,
+                findRequestIndex(tb1, DATA1_TABLE_ID),
+                new AuthorizationException("first table is not authorized"));
+
+        assertThat(firstFuture.get()).isInstanceOf(AuthorizationException.class);
+        assertThat(secondFuture.isDone()).isFalse();
+        assertThat(sender.numOfInFlightBatches(secondTableBucket)).isEqualTo(1);
+        assertThat(pendingWriteRequestTableIds(tb1)).containsExactly(DATA2_TABLE_ID);
+
+        finishRequest(
+                tb1,
+                findRequestIndex(tb1, DATA2_TABLE_ID),
+                createProduceLogResponse(secondTableBucket, 0L, 1L));
+        assertThat(secondFuture.get()).isNull();
+        assertThat(sender.numOfInFlightBatches(secondTableBucket)).isEqualTo(0);
+    }
+
+    @Test
     void testRetryPutKeyWithSchemaNotExistException() throws Exception {
         TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
 
@@ -882,6 +1072,146 @@ final class SenderTest {
         finishRequest(tableBucket, 0, createPutKvResponse(tableBucket, 1));
         assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(0);
         assertThat(future.get()).isNull();
+    }
+
+    @Test
+    void testPutKvPressureResponseAppliesBucketThrottle() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        CompletableFuture<Exception> future = new CompletableFuture<>();
+        appendKvToAccumulator(
+                tableBucket,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"}),
+                (tb, leo, e) -> future.complete(e));
+
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+
+        PutKvResponse response = createPutKvResponse(tableBucket, 1, 0.5f);
+        assertThat(response.getBucketsRespsList().get(0).hasPressure()).isTrue();
+        finishRequest(tableBucket, 0, response);
+
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(0);
+        assertThat(future.get()).isNull();
+        assertThat(accumulator.isThrottled(tableBucket)).isTrue();
+    }
+
+    @Test
+    void testPutKvStorageBackpressureResponseAppliesRetryBackoff() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        CompletableFuture<Exception> future = new CompletableFuture<>();
+        appendKvToAccumulator(
+                tableBucket,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"}),
+                (tb, leo, e) -> future.complete(e));
+
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+        finishRequest(
+                tableBucket,
+                0,
+                createPutKvResponse(tableBucket, Errors.STORAGE_BACKPRESSURE_EXCEPTION));
+
+        assertThat(accumulator.isThrottled(tableBucket)).isTrue();
+        assertThat(future.isDone()).isFalse();
+
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(0);
+        assertThat(pendingRequestSize(tableBucket)).isEqualTo(0);
+    }
+
+    @Test
+    void testPutKvStorageExceptionResponseRetriesInsteadOfFailing() throws Exception {
+        // Rolling-upgrade anchor: an old client receives the server-side downgraded
+        // KV_STORAGE_EXCEPTION (instead of the unknown error code 72, which would map to the
+        // non-retriable UNKNOWN_SERVER_ERROR) and must retry the batch instead of failing it.
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        CompletableFuture<Exception> future = new CompletableFuture<>();
+        appendKvToAccumulator(
+                tableBucket,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"}),
+                (tb, leo, e) -> future.complete(e));
+
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+        finishRequest(
+                tableBucket, 0, createPutKvResponse(tableBucket, Errors.KV_STORAGE_EXCEPTION));
+
+        // The batch is re-enqueued for retry rather than completed with an exception.
+        assertThat(future.isDone()).isFalse();
+
+        // Unlike STORAGE_BACKPRESSURE_EXCEPTION, no throttle is installed, so the retried batch
+        // is sent out again immediately and completes once the server recovers.
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+        finishRequest(tableBucket, 0, createPutKvResponse(tableBucket, 1L));
+        assertThat(future.get()).isNull();
+    }
+
+    @Test
+    void testPutKvRpcFailuresRetryOnlyOwnedTableBatches() throws Exception {
+        TablePath secondTablePath = TablePath.of("test_db_2", "test_pk_table_2");
+        TableInfo secondTableInfo =
+                TableInfo.of(
+                        secondTablePath,
+                        DATA2_TABLE_ID,
+                        1,
+                        DATA1_TABLE_DESCRIPTOR_PK,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        System.currentTimeMillis(),
+                        System.currentTimeMillis());
+        resetTableInfosWith(secondTableInfo);
+
+        TableBucket firstTableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        TableBucket secondTableBucket = new TableBucket(DATA2_TABLE_ID, 0);
+        CompletableFuture<Exception> firstFuture = new CompletableFuture<>();
+        CompletableFuture<Exception> secondFuture = new CompletableFuture<>();
+        appendKvToAccumulator(
+                firstTableBucket,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"}),
+                (tb, leo, e) -> firstFuture.complete(e));
+        appendKvToAccumulator(
+                secondTableInfo,
+                secondTableBucket,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {2, "b"}),
+                (tb, leo, e) -> secondFuture.complete(e));
+
+        sender.runOnce();
+        assertThat(pendingWriteRequestTableIds(tb1))
+                .containsExactlyInAnyOrder(DATA1_TABLE_ID_PK, DATA2_TABLE_ID);
+        Cluster clusterBeforeFailures = metadataUpdater.getCluster();
+
+        failRequest(
+                tb1,
+                findRequestIndex(tb1, DATA1_TABLE_ID_PK),
+                new NetworkException("first table request failed"));
+        assertThat(writerMetricGroup.recordsRetryTotal().getCount()).isEqualTo(1L);
+        assertThat(sender.numOfInFlightBatches(firstTableBucket)).isEqualTo(0);
+        assertThat(sender.numOfInFlightBatches(secondTableBucket)).isEqualTo(1);
+
+        failRequest(
+                tb1,
+                findRequestIndex(tb1, DATA2_TABLE_ID),
+                new NetworkException("second table request failed"));
+        assertThat(firstFuture.isDone()).isFalse();
+        assertThat(secondFuture.isDone()).isFalse();
+        assertThat(writerMetricGroup.recordsRetryTotal().getCount()).isEqualTo(2L);
+        assertThat(sender.numOfInFlightBatches(secondTableBucket)).isEqualTo(0);
+
+        metadataUpdater.updateCluster(clusterBeforeFailures);
+        sender.runOnce();
+        assertThat(pendingWriteRequestTableIds(tb1))
+                .containsExactlyInAnyOrder(DATA1_TABLE_ID_PK, DATA2_TABLE_ID);
+
+        finishRequest(
+                tb1,
+                findRequestIndex(tb1, DATA1_TABLE_ID_PK),
+                createPutKvResponse(firstTableBucket, 1L));
+        finishRequest(
+                tb1,
+                findRequestIndex(tb1, DATA2_TABLE_ID),
+                createPutKvResponse(secondTableBucket, 1L));
+        assertThat(firstFuture.get()).isNull();
+        assertThat(secondFuture.get()).isNull();
     }
 
     @Test
@@ -925,6 +1255,14 @@ final class SenderTest {
         return new TestingMetadataUpdater(tableInfos);
     }
 
+    private void resetTableInfosWith(TableInfo tableInfo) {
+        Map<TablePath, TableInfo> tableInfos = new HashMap<>();
+        tableInfos.put(DATA1_TABLE_PATH, DATA1_TABLE_INFO);
+        tableInfos.put(DATA1_TABLE_PATH_PK, DATA1_TABLE_INFO_PK);
+        tableInfos.put(tableInfo.getTablePath(), tableInfo);
+        metadataUpdater.updateTableInfos(tableInfos);
+    }
+
     private void appendToAccumulator(TableBucket tb, GenericRow row, WriteCallback writeCallback)
             throws Exception {
         appendToAccumulator(DATA1_TABLE_INFO, tb, row, writeCallback);
@@ -934,10 +1272,39 @@ final class SenderTest {
             TableInfo tableInfo, TableBucket tb, GenericRow row, WriteCallback writeCallback)
             throws Exception {
         accumulator.append(
-                WriteRecord.forArrowAppend(tableInfo, DATA1_PHYSICAL_TABLE_PATH, row, null),
+                WriteRecord.forArrowAppend(
+                        tableInfo, PhysicalTablePath.of(tableInfo.getTablePath()), row, null),
                 writeCallback,
                 metadataUpdater.getCluster(),
                 tb.getBucket(),
+                false);
+    }
+
+    private void appendKvToAccumulator(
+            TableBucket tableBucket, BinaryRow row, WriteCallback writeCallback) throws Exception {
+        appendKvToAccumulator(DATA1_TABLE_INFO_PK, tableBucket, row, writeCallback);
+    }
+
+    private void appendKvToAccumulator(
+            TableInfo tableInfo,
+            TableBucket tableBucket,
+            BinaryRow row,
+            WriteCallback writeCallback)
+            throws Exception {
+        int[] pkIndex = DATA1_SCHEMA_PK.getPrimaryKeyIndexes();
+        byte[] key = new CompactedKeyEncoder(DATA1_ROW_TYPE, pkIndex).encodeKey(row);
+        accumulator.append(
+                WriteRecord.forUpsert(
+                        tableInfo,
+                        PhysicalTablePath.of(tableInfo.getTablePath()),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null),
+                writeCallback,
+                metadataUpdater.getCluster(),
+                tableBucket.getBucket(),
                 false);
     }
 
@@ -963,6 +1330,44 @@ final class SenderTest {
                         metadataUpdater.newTabletServerClientForNode(
                                 metadataUpdater.leaderFor(DATA1_TABLE_PATH, tb));
         return gateway.pendingRequestSize();
+    }
+
+    private int findRequestIndex(TableBucket referenceBucket, long tableId) {
+        int requestCount = pendingRequestSize(referenceBucket);
+        for (int index = 0; index < requestCount; index++) {
+            if (getWriteRequestTableId(getRequest(referenceBucket, index)) == tableId) {
+                return index;
+            }
+        }
+        throw new IllegalStateException("No pending write request for table " + tableId);
+    }
+
+    private List<Long> pendingWriteRequestTableIds(TableBucket referenceBucket) {
+        List<Long> tableIds = new ArrayList<>();
+        int requestCount = pendingRequestSize(referenceBucket);
+        for (int index = 0; index < requestCount; index++) {
+            tableIds.add(getWriteRequestTableId(getRequest(referenceBucket, index)));
+        }
+        return tableIds;
+    }
+
+    private static long getWriteRequestTableId(ApiMessage request) {
+        if (request instanceof ProduceLogRequest) {
+            return ((ProduceLogRequest) request).getTableId();
+        }
+        if (request instanceof PutKvRequest) {
+            return ((PutKvRequest) request).getTableId();
+        }
+        throw new IllegalArgumentException(
+                "Expected a write request but found " + request.getClass().getName());
+    }
+
+    private void failRequest(TableBucket referenceBucket, int index, Throwable throwable) {
+        TestTabletServerGateway gateway =
+                (TestTabletServerGateway)
+                        metadataUpdater.newTabletServerClientForNode(
+                                metadataUpdater.leaderFor(DATA1_TABLE_PATH, referenceBucket));
+        gateway.failRequest(index, throwable);
     }
 
     private void finishIdempotentProduceLogRequest(
@@ -993,6 +1398,11 @@ final class SenderTest {
     private PutKvResponse createPutKvResponse(TableBucket tb, long endOffset) {
         return makePutKvResponse(
                 Collections.singletonList(new PutKvResultForBucket(tb, endOffset)));
+    }
+
+    private PutKvResponse createPutKvResponse(TableBucket tb, long endOffset, float pressure) {
+        return makePutKvResponse(
+                Collections.singletonList(new PutKvResultForBucket(tb, endOffset, pressure)));
     }
 
     private PutKvResponse createPutKvResponse(TableBucket tb, Errors error) {

@@ -463,7 +463,7 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
   </thead>
   <tbody>
     <tr>
-      <th rowspan="33"><strong>tabletserver</strong></th>
+      <th rowspan="37"><strong>tabletserver</strong></th>
       <td style={{textAlign: 'center', verticalAlign: 'middle' }} rowspan="25">-</td>
       <td>messagesInPerSecond</td>
       <td>The number of messages written per second to this server.</td>
@@ -590,6 +590,27 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
       <td>Meter</td>
     </tr>
     <tr>
+      <td rowspan="4">historical</td>
+      <td>inflightRequests</td>
+      <td>The number of accepted historical requests that have not completed.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>lookupCacheDiskSize</td>
+      <td>The current historical lookup cache footprint on local disk, in bytes.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>lookupCacheTableCount</td>
+      <td>The number of table lookupers currently retained in the historical lookup cache.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>lookupCacheCapacityEvictions</td>
+      <td>The cumulative number of cached table lookupers evicted because the cache retains at most ten tables.</td>
+      <td>Counter</td>
+    </tr>
+    <tr>
       <td rowspan="2">logicalStorage</td>
       <td>logSize</td>
       <td>The logical storage size of log managed by this TabletServer.</td>
@@ -678,7 +699,9 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
       <td rowspan="7">
           request_produceLog
           request_putKv
+          request_historicalPutKv
           request_lookup
+          request_historicalLookup
           request_prefixLookup
           request_metadata
           request_fetchLogClient
@@ -767,7 +790,7 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
   </thead>
   <tbody>
     <tr>
-      <th rowspan="31"><strong>tabletserver</strong></th>
+      <th rowspan="39"><strong>tabletserver</strong></th>
       <td rowspan="20">table</td>
       <td>messagesInPerSecond</td>
       <td>The number of messages written per second to this table.</td>
@@ -868,6 +891,37 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
       <td>The number of failed delete remote log requests to delete remote log after log ttl per second.</td>
       <td>Meter</td>
     </tr>
+    <tr>
+      <td rowspan="6">table_historical</td>
+      <td>totalPutKvRequestsPerSecond</td>
+      <td>The number of historical put kv requests to this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedPutKvRequestsPerSecond</td>
+      <td>The number of historical put kv requests that failed unexpectedly for this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>totalLookupRequestsPerSecond</td>
+      <td>The number of historical lookup requests to this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>failedLookupRequestsPerSecond</td>
+      <td>The number of historical lookup requests that failed unexpectedly for this table per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>lakeLookupsPerSecond</td>
+      <td>The number of historical lake point lookups performed for this table per second, labeled with <code>lookup_file_downloaded</code>.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>lakeLookupTimeMs</td>
+      <td>The time spent on a historical lake point lookup, in milliseconds, labeled with <code>lookup_file_downloaded</code>.</td>
+      <td>Histogram</td>
+    </tr>
      <tr>
       <td rowspan="3">table_bucket_log</td>
       <td>numSegments</td>
@@ -921,6 +975,12 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
       <td>The number of bytes written per second to this table.</td>
       <td>Gauge</td>
     </tr>
+    <tr>
+      <td>table_bucket_physicalStorage</td>
+      <td>localLogSize</td>
+      <td>The physical size, in bytes, of all local log segments for this table bucket on this TabletServer. The metric is reported for both leader and follower replicas and includes the partition and bucket variables. Sum it by partition or table, and across TabletServers, to obtain the corresponding local log footprint including replication.</td>
+      <td>Gauge</td>
+    </tr>
      <tr>
       <td rowspan="2">table_bucket_logicalStorage</td>
       <td>logSize</td>
@@ -934,6 +994,10 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
     </tr>
   </tbody>
 </table>
+
+For <code>lakeLookupsPerSecond</code> and <code>lakeLookupTimeMs</code>,
+<code>lookup_file_downloaded="true"</code> means that the lookup downloaded at least one local
+lookup file; <code>false</code> means that it did not download a local lookup file.
 
 ### RocksDB
 
@@ -1103,6 +1167,36 @@ These metrics use Sum aggregation to show the total value across all tables in a
       <td>rocksdbBlockCachePinnedUsageTotal</td>
       <td>Total pinned memory in block cache across all buckets of this table (in bytes).</td>
       <td>Gauge</td>
+    </tr>
+  </tbody>
+</table>
+
+### KV Backpressure
+
+KV backpressure metrics report the cooperative backpressure signal computed by primary-key tables on top of RocksDB. These metrics are aggregated from all buckets of a table and expose two core signals: peak intensity and cumulative hard rejections.
+
+<table class="table table-bordered">
+  <thead>
+    <tr>
+      <th class="text-left" style={{width: '30pt'}}>Scope</th>
+      <th class="text-left" style={{width: '150pt'}}>Infix</th>
+      <th class="text-left" style={{width: '80pt'}}>Metrics</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '40pt'}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th rowspan="2"><strong>tabletserver</strong></th>
+      <td rowspan="2">table</td>
+      <td>kvBackpressureMaxPressure</td>
+      <td>Maximum normalized backpressure value across all buckets of this table, in <code>[0, 1)</code>. A value approaching <code>1</code> indicates the hottest bucket is close to the storage engine's hard-rejection trigger.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>kvBackpressureRejectionsTotal</td>
+      <td>Total number of write requests rejected with <code>StorageBackpressureException</code> on this table since process start.</td>
+      <td>Counter</td>
     </tr>
   </tbody>
 </table>

@@ -22,7 +22,7 @@ rust-version = { workspace = true }
 version = { workspace = true }
 name = "fluss-rs"
 authors = { workspace = true }
-description = "The official rust client of Apache Fluss (Incubating)"
+description = "The official rust client of Apache Fluss"
 homepage = "https://fluss.apache.org/docs/apis/rust/installation/"
 repository = { workspace = true }
 keywords = { workspace = true }
@@ -86,6 +86,3 @@ fluss-test-cluster = { path = "../fluss-test-cluster" }
 # workspace `full` feature set; enable it for tests so the
 # `last_poll_seconds_ago` ticker loop can be driven deterministically.
 tokio = { workspace = true, features = ["test-util"] }
-
-[build-dependencies]
-prost-build = "0.14"

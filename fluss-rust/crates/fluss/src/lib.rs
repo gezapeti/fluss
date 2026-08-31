@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache Fluss (Incubating) Official Rust Client
+//! Apache Fluss Official Rust Client
 //!
-//! Official Rust client library for [Apache Fluss (Incubating)](https://fluss.apache.org/).
+//! Official Rust client library for [Apache Fluss](https://fluss.apache.org/).
 //! It supports **primary key (KV) tables** (upsert + lookup) and **log tables** (append + scan).
 //!
 //! # Examples
@@ -123,6 +123,7 @@
 
 pub mod client;
 pub mod metadata;
+pub mod predicate;
 pub mod record;
 pub mod row;
 pub mod rpc;
@@ -152,5 +153,5 @@ pub(crate) mod proto {
     // caller yet, and the generated doc comments aren't clippy-clean.
     #![allow(dead_code)]
     #![allow(clippy::doc_lazy_continuation)]
-    include!(concat!(env!("OUT_DIR"), "/fluss.rs"));
+    include!("proto/fluss.rs");
 }

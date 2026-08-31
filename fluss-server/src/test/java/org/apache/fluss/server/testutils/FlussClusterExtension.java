@@ -337,6 +337,7 @@ public final class FlussClusterExtension
         tabletServerConf.setString(
                 ConfigOptions.ZOOKEEPER_ADDRESS, zooKeeperServer.getConnectString());
         tabletServerConf.setString(ConfigOptions.BIND_LISTENERS, tabletServerListeners);
+        tabletServerConf.setDouble(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 1.0);
         if (overwriteConfig != null) {
             tabletServerConf.addAll(overwriteConfig);
         }
@@ -942,8 +943,21 @@ public final class FlussClusterExtension
                 "Fail to wait partitions dropped");
     }
 
+    /** Wait until the assigned replica is ready as the local leader and return its server id. */
     public int waitAndGetLeader(TableBucket tb) {
-        return waitLeaderAndIsrReady(tb).leader();
+        ZooKeeperClient zkClient = getZooKeeperClient();
+        return waitValue(
+                () -> {
+                    Optional<LeaderAndIsr> leaderAndIsrOpt = zkClient.getLeaderAndIsr(tb);
+                    if (!leaderAndIsrOpt.isPresent()) {
+                        return Optional.empty();
+                    }
+
+                    int leader = leaderAndIsrOpt.get().leader();
+                    return getReplica(tb, leader, true).map(ignored -> leader);
+                },
+                Duration.ofMinutes(1),
+                "Fail to wait leader replica ready for " + tb);
     }
 
     public int waitAndGetStandby(TableBucket tb) {

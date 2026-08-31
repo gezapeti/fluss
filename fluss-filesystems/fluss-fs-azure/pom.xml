@@ -28,7 +28,7 @@
     </parent>
 
     <artifactId>fluss-fs-azure</artifactId>
-    <name>Apache Fluss (Incubating) : FileSystems : Azure FS</name>
+    <name>Apache Fluss : FileSystems : Azure FS</name>
 
     <packaging>jar</packaging>
 
@@ -236,6 +236,12 @@
                                     </excludes>
                                 </filter>
                             </filters>
+                            <relocations>
+                                <relocation>
+                                    <pattern>org.apache.commons</pattern>
+                                    <shadedPattern>org.apache.fluss.shaded.org.apache.commons</shadedPattern>
+                                </relocation>
+                            </relocations>
                         </configuration>
                     </execution>
                 </executions>

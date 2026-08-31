@@ -28,18 +28,9 @@
 
     <artifactId>fluss-test-coverage</artifactId>
     <packaging>jar</packaging>
-    <name>Apache Fluss (Incubating) : Test Code Coverage</name>
+    <name>Apache Fluss : Test Code Coverage</name>
     <description>
         Module for aggregating code coverage across all modules.
-
-        Apache Fluss is an effort undergoing incubation at The Apache Software
-        Foundation (ASF), sponsored by the Apache Incubator PMC. Incubation is
-        required of all newly accepted projects until a further review indicates
-        that the infrastructure, communications, and decision-making process have
-        stabilized in a manner consistent with other successful ASF projects.
-        While incubation status is not necessarily a reflection of the
-        completeness or stability of the code, it does indicate that the project
-        has yet to be fully endorsed by the ASF.
     </description>
 
     <dependencies>
@@ -75,6 +66,13 @@
         <dependency>
             <groupId>org.apache.fluss</groupId>
             <artifactId>fluss-flink-common</artifactId>
+            <version>${project.version}</version>
+            <scope>compile</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.fluss</groupId>
+            <artifactId>fluss-flink-2.3</artifactId>
             <version>${project.version}</version>
             <scope>compile</scope>
         </dependency>
@@ -490,6 +488,16 @@
                                         <exclude>org.apache.fluss.predicate.*</exclude>
                                         <!-- end exclude for lake source -->
                                         <exclude>org.apache.fluss.lake.source.*</exclude>
+                                        <exclude>org.apache.fluss.lake.lakestorage.LakeStorage</exclude>
+                                        <exclude>
+                                            org.apache.fluss.lake.lakestorage.LakeStorage.LookuperContext
+                                        </exclude>
+                                        <exclude>
+                                            org.apache.fluss.lake.lakestorage.LakeTableLookuper.LookupContext
+                                        </exclude>
+                                        <exclude>
+                                            org.apache.fluss.lake.lakestorage.PluginLakeStorageWrapper*
+                                        </exclude>
                                         <!-- exclude for readiness-probe CLI tool and dist dummy class -->
                                         <exclude>org.apache.fluss.server.tools.ClusterHealthReadinessCheck</exclude>
                                         <exclude>org.apache.fluss.server.tools.ClusterHealthReadinessCheck.*</exclude>
@@ -497,6 +505,9 @@
                                         <exclude>org.apache.fluss.flink.DummyClass120</exclude>
                                         <exclude>org.apache.fluss.lake.batch.ArrowRecordBatch</exclude>
                                         <exclude>org.apache.fluss.lake.committer.CommittedLakeSnapshot</exclude>
+                                        <exclude>
+                                            org.apache.fluss.lake.paimon.lookup.PaimonLakeTableLookuper.TrackingIOManager
+                                        </exclude>
                                         <exclude>org.apache.fluss.lake.paimon.utils.FlussDataTypeToPaimonDataType</exclude>
                                         <exclude>org.apache.paimon.arrow.converter.Arrow2PaimonVectorConverter*</exclude>
                                         <!-- start exclude for lake lance -->

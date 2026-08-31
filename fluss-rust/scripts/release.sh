@@ -15,10 +15,9 @@
 # limitations under the License.
 #
 # Create ASF source release artifacts under dist/ (aligned with Fluss release package format):
-#   fluss-rust-{version}-incubating.tgz
-#   fluss-rust-{version}-incubating.tgz.asc
-#   fluss-rust-{version}-incubating.tgz.sha512
-# (Incubator policy requires "incubating" in the artifact name.)
+#   fluss-rust-{version}.tgz
+#   fluss-rust-{version}.tgz.asc
+#   fluss-rust-{version}.tgz.sha512
 # Run from repo root. Check out the release tag first (e.g. git checkout v0.1.0-rc1).
 # Usage: ./scripts/release.sh [version]
 #   If version is omitted, it is read from Cargo.toml (workspace.package.version).
@@ -38,7 +37,7 @@ else
   fi
 fi
 
-PREFIX="fluss-rust-${VERSION}-incubating"
+PREFIX="fluss-rust-${VERSION}"
 DIST_DIR="${REPO_ROOT}/dist"
 TARBALL="${PREFIX}.tgz"
 
@@ -47,6 +46,21 @@ mkdir -p "$DIST_DIR"
 
 echo "Creating source archive: ${TARBALL}"
 git archive --format=tar.gz --prefix="${PREFIX}/" -o "${DIST_DIR}/${TARBALL}" HEAD
+
+# The archive root is fluss-rust/, not the repo root, so it does not inherit the
+# repo's LICENSE/NOTICE. An ASF source release must carry both.
+echo "Verifying LICENSE and NOTICE at archive root"
+ARCHIVE_FILES=$(tar -tzf "${DIST_DIR}/${TARBALL}")
+for f in LICENSE NOTICE; do
+  if ! echo "$ARCHIVE_FILES" | grep -qx "${PREFIX}/${f}"; then
+    echo "Error: ${f} is missing from the root of ${TARBALL}"
+    exit 1
+  fi
+  if [ -z "$(tar -xzOf "${DIST_DIR}/${TARBALL}" "${PREFIX}/${f}")" ]; then
+    echo "Error: ${f} is empty in ${TARBALL}"
+    exit 1
+  fi
+done
 
 echo "Generating SHA-512 checksum: ${TARBALL}.sha512"
 if command -v shasum >/dev/null 2>&1; then
@@ -64,4 +78,4 @@ echo "Verifying signature"
 echo "Done. Artifacts in dist/:"
 ls -la "${DIST_DIR}/"
 echo ""
-echo "Next: upload contents of dist/ to SVN (see docs/creating-a-release.md)."
+echo "Next: upload contents of dist/ to SVN (see website/docs/release/create-release.md)."

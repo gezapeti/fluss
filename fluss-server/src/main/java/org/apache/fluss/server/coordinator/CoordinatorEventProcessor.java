@@ -988,6 +988,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 oldTableInfo.getTableConfig().getAutoPartitionStrategy();
         AutoPartitionStrategy newAutoPartitionStrategy =
                 newTableInfo.getTableConfig().getAutoPartitionStrategy();
+
         if (!Objects.equals(oldAutoPartitionStrategy, newAutoPartitionStrategy)) {
             LOG.info(
                     "Table {} auto partition strategy changed from {} to {}.",
@@ -2034,6 +2035,30 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 throw new InvalidUpdateVersionException(
                         "The request bucket epoch in adjust isr request is lower than current bucket epoch in coordinator.");
             } else {
+                if (newLeaderAndIsr.leader() != currentLeaderAndIsr.leader()) {
+                    String errorMsg =
+                            String.format(
+                                    "Rejecting adjustIsr request for table bucket %s because request leader %s "
+                                            + "does not match current leader %s",
+                                    tableBucket,
+                                    newLeaderAndIsr.leader(),
+                                    currentLeaderAndIsr.leader());
+                    LOG.error(errorMsg);
+                    throw new FencedLeaderEpochException(errorMsg);
+                }
+
+                if (!newLeaderAndIsr.isr().contains(currentLeaderAndIsr.leader())) {
+                    String errorMsg =
+                            String.format(
+                                    "Rejecting adjustIsr request for table bucket %s because leader %s "
+                                            + "is not in the new ISR %s",
+                                    tableBucket,
+                                    currentLeaderAndIsr.leader(),
+                                    newLeaderAndIsr.isr());
+                    LOG.error(errorMsg);
+                    throw new IneligibleReplicaException(errorMsg);
+                }
+
                 // Check if the new ISR are all ineligible replicas (doesn't contain any shutting
                 // down tabletServers).
                 Set<Integer> ineligibleReplicas = new HashSet<>(newLeaderAndIsr.isr());
@@ -2171,7 +2196,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                                         tb, leaderAndIsr.leader()),
                                                 tb,
                                                 manifestData.getRemoteLogStartOffset(),
-                                                manifestData.getRemoteLogEndOffset()));
+                                                manifestData.getRemoteLogEndOffset(),
+                                                manifestData.getHighestCopiedEndOffset()));
         coordinatorRequestBatch.sendNotifyRemoteLogOffsetsRequest(
                 coordinatorContext.getCoordinatorEpoch());
         return response;
@@ -2278,6 +2304,16 @@ public class CoordinatorEventProcessor implements EventProcessor {
             CompletableFuture<CommitLakeTableSnapshotResponse> callback) {
         CommitLakeTableSnapshotsData commitLakeTableSnapshotsData =
                 commitLakeTableSnapshotEvent.getCommitLakeTableSnapshotsData();
+        Map<Long, CommitLakeTableSnapshotsData.CommitLakeTableSnapshot>
+                commitLakeTableSnapshotByTableId =
+                        commitLakeTableSnapshotsData.getCommitLakeTableSnapshotByTableId();
+        Set<Long> unavailableTableIds = new HashSet<>();
+        for (Long tableId : commitLakeTableSnapshotByTableId.keySet()) {
+            if (coordinatorContext.getTablePathById(tableId) == null
+                    || coordinatorContext.isTableQueuedForDeletion(tableId)) {
+                unavailableTableIds.add(tableId);
+            }
+        }
         ioExecutor.execute(
                 () -> {
                     try {
@@ -2285,10 +2321,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                 new CommitLakeTableSnapshotResponse();
                         Set<Long> failedTableIds = new HashSet<>();
                         for (Map.Entry<Long, CommitLakeTableSnapshotsData.CommitLakeTableSnapshot>
-                                entry :
-                                        commitLakeTableSnapshotsData
-                                                .getCommitLakeTableSnapshotByTableId()
-                                                .entrySet()) {
+                                entry : commitLakeTableSnapshotByTableId.entrySet()) {
                             PbCommitLakeTableSnapshotRespForTable tableResp =
                                     response.addTableResp();
                             long tableId = entry.getKey();
@@ -2299,6 +2332,12 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                 if (snapshot.getLakeSnapshotMetadata() == null) {
                                     throw new FlussRuntimeException(
                                             "Lake snapshot metadata is null for table " + tableId);
+                                }
+                                if (unavailableTableIds.contains(tableId)) {
+                                    throw new TableNotExistException(
+                                            "Table "
+                                                    + tableId
+                                                    + " not found or queued for deletion in coordinator context.");
                                 }
                                 lakeTableHelper.registerLakeTableSnapshotV2(
                                         tableId,

@@ -20,6 +20,7 @@ package org.apache.fluss.server.tablet;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.exception.AuthorizationException;
 import org.apache.fluss.exception.InvalidScanRequestException;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.ScannerExpiredException;
 import org.apache.fluss.exception.StaleMetadataException;
@@ -27,6 +28,7 @@ import org.apache.fluss.exception.UnknownScannerIdException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
@@ -85,10 +87,12 @@ import org.apache.fluss.server.RpcServiceBase;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.entity.FetchReqInfo;
+import org.apache.fluss.server.entity.LookupDataForBucket;
 import org.apache.fluss.server.entity.NotifyKvSnapshotOffsetData;
 import org.apache.fluss.server.entity.NotifyLakeTableOffsetData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyRemoteLogOffsetsData;
+import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.UserContext;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
@@ -120,6 +124,8 @@ import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.hasHistoricalLookup;
+import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.hasHistoricalPut;
 import static org.apache.fluss.security.acl.OperationType.DESCRIBE;
 import static org.apache.fluss.security.acl.OperationType.READ;
 import static org.apache.fluss.security.acl.OperationType.WRITE;
@@ -132,7 +138,6 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifyLeade
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifyRemoteLogOffsetsData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifySnapshotOffsetData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getProduceLogData;
-import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getPutKvData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getStopReplicaData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getTableFilterInfoMap;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getTableStatsRequestData;
@@ -149,8 +154,10 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makePrefixLook
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeProduceLogResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makePutKvResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeStopReplicaResponse;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toHistoricalLookupData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toLookupData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toPrefixLookupData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toPutKvDataForBuckets;
 
 /** An RPC Gateway service for tablet server. */
 public final class TabletService extends RpcServiceBase implements TabletServerGateway {
@@ -279,50 +286,82 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     public CompletableFuture<PutKvResponse> putKv(PutKvRequest request) {
         authorizeTable(WRITE, request.getTableId());
 
-        Map<TableBucket, KvRecordBatch> putKvData = getPutKvData(request);
+        List<PutKvDataForBucket> putKvData = toPutKvDataForBuckets(request);
         // Get mergeMode from request, default to DEFAULT if not set
         MergeMode mergeMode =
                 request.hasAggMode()
                         ? MergeMode.fromValue(request.getAggMode())
                         : MergeMode.DEFAULT;
         CompletableFuture<PutKvResponse> response = new CompletableFuture<>();
-        replicaManager.putRecordsToKv(
-                request.getTimeoutMs(),
-                request.getAcks(),
-                putKvData,
-                getTargetColumns(request),
-                mergeMode,
-                currentSession().getApiVersion(),
-                bucketResponse -> response.complete(makePutKvResponse(bucketResponse)));
+        if (hasHistoricalPut(request)) {
+            replicaManager.putHistoricalRecordsToKv(
+                    request.getTimeoutMs(),
+                    request.getAcks(),
+                    putKvData,
+                    getTargetColumns(request),
+                    mergeMode,
+                    currentSession().getApiVersion(),
+                    bucketResponse -> response.complete(makePutKvResponse(bucketResponse)));
+        } else {
+            Map<TableBucket, KvRecordBatch> recordsByBucket = new HashMap<>();
+            putKvData.forEach(
+                    putData -> recordsByBucket.put(putData.tableBucket(), putData.records()));
+            replicaManager.putRecordsToKv(
+                    request.getTimeoutMs(),
+                    request.getAcks(),
+                    recordsByBucket,
+                    getTargetColumns(request),
+                    mergeMode,
+                    currentSession().getApiVersion(),
+                    bucketResponse -> response.complete(makePutKvResponse(bucketResponse)));
+        }
         return response;
     }
 
     @Override
     public CompletableFuture<LookupResponse> lookup(LookupRequest request) {
-        Map<TableBucket, List<byte[]>> lookupData = toLookupData(request);
         Map<TableBucket, LookupResultForBucket> errorResponseMap = new HashMap<>();
         CompletableFuture<LookupResponse> response = new CompletableFuture<>();
 
         if (request.hasInsertIfNotExists() && request.isInsertIfNotExists()) {
             authorizeTable(WRITE, request.getTableId());
+            if (hasHistoricalLookup(request)) {
+                throw new InvalidTableException(
+                        "Lookup with insertIfNotExists is not supported for "
+                                + "historical partition lookup.");
+            }
+            Map<TableBucket, List<byte[]>> normalLookupData = toLookupData(request);
             replicaManager.lookups(
                     request.isInsertIfNotExists(),
                     request.getTimeoutMs(),
                     request.getAcks(),
-                    lookupData,
+                    normalLookupData,
                     currentSession().getApiVersion(),
                     value -> response.complete(makeLookupResponse(value, errorResponseMap)));
         } else {
-            Map<TableBucket, List<byte[]>> interesting =
-                    authorizeRequestData(
-                            READ, lookupData, errorResponseMap, LookupResultForBucket::new);
-            if (interesting.isEmpty()) {
-                return CompletableFuture.completedFuture(makeLookupResponse(errorResponseMap));
+            boolean historicalLookupRequest = hasHistoricalLookup(request);
+            if (historicalLookupRequest) {
+                List<LookupDataForBucket> historicalLookupData = toHistoricalLookupData(request);
+                authorizeTable(READ, request.getTableId());
+                replicaManager.historicalLookups(
+                        historicalLookupData,
+                        value -> response.complete(makeLookupResponse(value)));
+            } else {
+                Map<TableBucket, List<byte[]>> normalLookupData = toLookupData(request);
+                Map<TableBucket, List<byte[]>> interesting =
+                        authorizeRequestData(
+                                READ,
+                                normalLookupData,
+                                errorResponseMap,
+                                LookupResultForBucket::new);
+                if (interesting.isEmpty()) {
+                    return CompletableFuture.completedFuture(makeLookupResponse(errorResponseMap));
+                }
+                replicaManager.lookups(
+                        interesting,
+                        currentSession().getApiVersion(),
+                        value -> response.complete(makeLookupResponse(value, errorResponseMap)));
             }
-            replicaManager.lookups(
-                    lookupData,
-                    currentSession().getApiVersion(),
-                    value -> response.complete(makeLookupResponse(value, errorResponseMap)));
         }
         return response;
     }
@@ -577,9 +616,8 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                                 bucketReq.getBucketId());
                 Long limit = bucketReq.hasLimit() ? bucketReq.getLimit() : null;
 
-                OpenScanResult openResult =
-                        scannerManager.createScanner(
-                                replicaManager.getReplicaOrException(tableBucket), limit);
+                Replica replica = replicaManager.getReplicaOrException(tableBucket);
+                OpenScanResult openResult = scannerManager.createScanner(replica, limit);
                 isNewScan = true;
                 initialLogOffset = openResult.getLogOffset();
 
@@ -651,8 +689,8 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
 
             // Catch a leadership flip ahead of the eventual closeScannersForBucket callback so
             // the client can redirect rather than consume a stale snapshot.
+            Replica replica = replicaManager.getReplicaOrException(context.getTableBucket());
             if (!request.hasBucketScanReq()) {
-                Replica replica = replicaManager.getReplicaOrException(context.getTableBucket());
                 if (!replica.isLeader()) {
                     throw new NotLeaderOrFollowerException(
                             String.format(
@@ -672,7 +710,11 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             boolean appendedAny = false;
             while (context.isValid()
                     && (!appendedAny || builder.sizeInBytes() < effectiveBatchSize)) {
-                builder.append(context.currentValue());
+                byte[] value = context.currentValue();
+                builder.append(
+                        value,
+                        context.getKvValueLayout().valueBodyOffset(),
+                        context.getKvValueLayout().valueBodyLength(value.length));
                 context.advance();
                 appendedAny = true;
             }
@@ -755,6 +797,19 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             }
             authorizeTable(operationType, tablePath);
         }
+    }
+
+    @Override
+    protected TableInfo getTableInfo(long tableId) {
+        TablePath tablePath = metadataCache.getTablePath(tableId).orElse(null);
+        if (tablePath == null) {
+            throw new UnknownTableOrBucketException(
+                    String.format(
+                            "This server %s does not know this table ID %s. This may happen when the table "
+                                    + "metadata cache in the server is not updated yet.",
+                            serviceName, tableId));
+        }
+        return metadataManager.getTable(tablePath);
     }
 
     private void authorizeAnyTable(OperationType operationType, List<TablePath> tablePaths) {

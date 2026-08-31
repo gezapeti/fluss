@@ -74,6 +74,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.function.BiConsumer;
 
 import static org.apache.fluss.server.utils.TableDescriptorValidation.validateAlterTableProperties;
 import static org.apache.fluss.server.utils.TableDescriptorValidation.validateAlterTableSchema;
@@ -504,12 +505,15 @@ public class MetadataManager {
         }
     }
 
+    /** Alters table properties and invokes the callbacks around the metadata update. */
     public void alterTableProperties(
             TablePath tablePath,
             List<TableChange> tableChanges,
             TablePropertyChanges tablePropertyChanges,
             boolean ignoreIfNotExists,
-            FlussPrincipal flussPrincipal) {
+            FlussPrincipal flussPrincipal,
+            BiConsumer<TableInfo, TableDescriptor> beforeUpdate,
+            BiConsumer<TableInfo, TableDescriptor> afterUpdate) {
         try {
             // it throws TableNotExistException if the table or database not exists
             TableRegistration tableReg = getTableRegistration(tablePath);
@@ -549,6 +553,8 @@ public class MetadataManager {
                 // reuse the same validate logic with the createTable() method
                 validateTableDescriptor(newDescriptor);
 
+                beforeUpdate.accept(tableInfo, newDescriptor);
+
                 // pre alter table properties, e.g. create lake table in lake storage if it's to
                 // enable datalake for the table
                 preAlterTableProperties(
@@ -558,6 +564,7 @@ public class MetadataManager {
                         tableReg.newProperties(
                                 newDescriptor.getProperties(), newDescriptor.getCustomProperties());
                 zookeeperClient.updateTable(tablePath, updatedTableRegistration);
+                afterUpdate.accept(tableInfo, newDescriptor);
             } else {
                 LOG.info(
                         "No properties changed when alter table {}, skip update table.", tablePath);
@@ -611,12 +618,18 @@ public class MetadataManager {
         // We should always alter lake table even though datalake is disabled.
         // Otherwise, if user alter the fluss table when datalake is disabled, then enable datalake
         // again, the lake table will mismatch.
-        // Only sync to lake if this table has ever opted into datalake (key present regardless of
-        // value).
+        // Sync to lake if this table has ever opted into datalake (key present regardless of
+        // value), or if this change is enabling datalake now. The latter is needed because
+        // resetting table.datalake.enabled removes the key entirely (see
+        // #getUpdatedTableDescriptor), so a later re-enable would otherwise see an old descriptor
+        // without the key and skip the alterTable call that re-applies lakestream.enabled.
+        boolean enablingDataLake =
+                isDataLakeEnabled(newDescriptor) && !isDataLakeEnabled(tableDescriptor);
         if (lakeCatalog != null
-                && tableDescriptor
-                        .getProperties()
-                        .containsKey(ConfigOptions.TABLE_DATALAKE_ENABLED.key())) {
+                && (enablingDataLake
+                        || tableDescriptor
+                                .getProperties()
+                                .containsKey(ConfigOptions.TABLE_DATALAKE_ENABLED.key()))) {
             try {
                 lakeCatalog.alterTable(tablePath, tableChanges, lakeCatalogContext);
             } catch (TableNotExistException e) {
@@ -902,10 +915,10 @@ public class MetadataManager {
         try {
             zookeeperClient.deletePartition(tablePath, partitionName);
         } catch (Exception e) {
-            LOG.error(
-                    "Fail to delete partition '{}' from zookeeper for table {}.",
-                    partitionName,
-                    tablePath,
+            throw new FlussRuntimeException(
+                    String.format(
+                            "Fail to delete partition '%s' from zookeeper for table %s.",
+                            partitionName, tablePath),
                     e);
         }
     }

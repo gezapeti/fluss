@@ -21,22 +21,24 @@ STAGE_CORE="core"
 STAGE_FLINK1="flink1"
 STAGE_FLINK2="flink2"
 STAGE_SPARK="spark3"
+STAGE_SPARK_LAKE="spark3-lake"
 STAGE_SPARK_SCALA213="spark3-scala213"
 STAGE_LAKE="lake"
 
+SPARK_LAKE_TEST_TAG="org.apache.fluss.spark.lake.SparkLakeTest"
+
 MODULES_FLINK1="\
 fluss-flink/fluss-flink-1.20,\
+fluss-flink/fluss-flink-1.19,\
 fluss-flink/fluss-flink-1.18\
 "
 
 MODULES_FLINK2="\
 fluss-flink,\
 fluss-flink/fluss-flink-common,\
-fluss-flink/fluss-flink-2.2\
+fluss-flink/fluss-flink-2.2,\
+fluss-flink/fluss-flink-2.3\
 "
-
-# Skip Flink 1.19 to reduce PR CI time; consider covering it in a daily CI run.
-MODULES_EXCLUDED_FROM_TEST="fluss-flink/fluss-flink-1.19"
 
 MODULES_COMMON_SPARK="\
 fluss-spark,\
@@ -69,10 +71,9 @@ function get_test_modules_for_stage() {
     local modules_lake=$MODULES_LAKE
     local negated_flink1=\!${MODULES_FLINK1//,/,\!}
     local negated_flink2=\!${MODULES_FLINK2//,/,\!}
-    local negated_excluded=\!${MODULES_EXCLUDED_FROM_TEST//,/,\!}
     local negated_spark=\!${MODULES_COMMON_SPARK//,/,\!}
     local negated_lake=\!${MODULES_LAKE//,/,\!}
-    local modules_core="$negated_flink1,$negated_flink2,$negated_excluded,$negated_spark,$negated_lake"
+    local modules_core="$negated_flink1,$negated_flink2,$negated_spark,$negated_lake"
 
     case ${stage} in
         (${STAGE_CORE})
@@ -85,10 +86,13 @@ function get_test_modules_for_stage() {
             echo "-pl fluss-test-coverage,$modules_flink2"
         ;;
         (${STAGE_SPARK})
-            echo "-pl fluss-test-coverage,$modules_spark3"
+            echo "-DtagsToExclude=$SPARK_LAKE_TEST_TAG -pl fluss-test-coverage,$modules_spark3"
+        ;;
+        (${STAGE_SPARK_LAKE})
+            echo "-DtagsToInclude=$SPARK_LAKE_TEST_TAG -pl fluss-test-coverage,$modules_spark3"
         ;;
         (${STAGE_SPARK_SCALA213})
-            echo "-Pscala-2.13 -pl fluss-test-coverage,$modules_spark3"
+            echo "-Pscala-2.13 -DtagsToExclude=$SPARK_LAKE_TEST_TAG -pl fluss-test-coverage,$modules_spark3"
         ;;
         (${STAGE_LAKE})
             echo "-pl fluss-test-coverage,$modules_lake"

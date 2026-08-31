@@ -15,6 +15,10 @@ The Tiering Service is implemented as an Apache Flink job that:
 - Maintains exactly-once semantics between Fluss and the data lake
 - Operates incrementally, syncing only missing data segments
 
+:::warning
+Never change the schema of a lake table managed by the Tiering Service through an external engine. The Tiering Service requires the lake table schema to stay in sync with the Fluss table schema, and a diverging schema makes the tiering job fail and restart in a loop until the schemas match again. For lake formats that support schema evolution through Fluss (Paimon and Iceberg), add columns with `ALTER TABLE` on the Fluss table instead. See [Schema Evolution](datalake-formats/paimon.md#schema-evolution) for the symptoms and the recovery steps with Paimon.
+:::
+
 For an in-depth look at the Tiering Service internals, see the blog series:
 
 - [Tiering Service Deep Dive — Part 1](https://fluss.apache.org/blog/fluss-tiering-service-deep-dive-part1/)
@@ -77,6 +81,7 @@ The following `--lake.tiering.*` options are set when starting the tiering job:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `lake.tiering.auto-expire-snapshot` | Boolean | false | Auto-trigger snapshot expiration on commit |
+| `lake.tiering.io.tmp.dirs` | String | Flink temporary directories | Local directories used for temporary I/O files. If not configured, a `fluss` child directory under each Flink temporary directory is used. Separate multiple directories with commas or the system path separator |
 
 ### Table-Level Options
 

@@ -28,7 +28,7 @@
     </parent>
 
     <artifactId>fluss-fs-gs</artifactId>
-    <name>Apache Fluss (Incubating) : FileSystems : Google Cloud Storage FS</name>
+    <name>Apache Fluss : FileSystems : Google Cloud Storage FS</name>
 
     <packaging>jar</packaging>
 
@@ -447,6 +447,12 @@
                                     </excludes>
                                 </filter>
                             </filters>
+                            <relocations>
+                                <relocation>
+                                    <pattern>org.apache.commons</pattern>
+                                    <shadedPattern>org.apache.fluss.shaded.org.apache.commons</shadedPattern>
+                                </relocation>
+                            </relocations>
                         </configuration>
                     </execution>
                 </executions>

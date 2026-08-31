@@ -29,6 +29,7 @@ import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.SecurityTokenException;
 import org.apache.fluss.exception.TableNotPartitionedException;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.token.ObtainedSecurityToken;
 import org.apache.fluss.metadata.DatabaseInfo;
@@ -38,6 +39,7 @@ import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.RpcGatewayService;
 import org.apache.fluss.rpc.gateway.AdminReadOnlyGateway;
 import org.apache.fluss.rpc.messages.ApiVersionsRequest;
@@ -127,6 +129,7 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toListPartitio
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toPbConfigEntries;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toPbDatabaseSummary;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTablePath;
+import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
 import static org.apache.fluss.utils.Preconditions.checkState;
 
 /**
@@ -182,6 +185,9 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
     }
 
     public abstract void authorizeTable(OperationType operationType, long tableId);
+
+    /** Returns table information for a table id known by the concrete server role. */
+    protected abstract TableInfo getTableInfo(long tableId);
 
     public void authorizeDatabase(OperationType operationType, String databaseName) {
         if (authorizer != null) {
@@ -381,7 +387,6 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
                             + tablePath
                             + "' is a partitioned table, but partition name is not provided.");
         }
-
         try {
             // get table id
             long tableId = tableInfo.getTableId();
@@ -424,6 +429,8 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
             GetKvSnapshotMetadataRequest request) {
         long tableId = request.getTableId();
         authorizeTable(OperationType.DESCRIBE, tableId);
+        TableInfo tableInfo = getTableInfo(tableId);
+        validateKvSnapshotMetadataVersion(currentSession().getApiVersion(), tableInfo);
 
         TableBucket tableBucket =
                 new TableBucket(
@@ -446,6 +453,17 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
                             "Failed to get kv snapshot metadata for table bucket %s and snapshot id %s. Error: %s",
                             tableBucket, snapshotId, e.getMessage()),
                     e);
+        }
+    }
+
+    static void validateKvSnapshotMetadataVersion(short apiVersion, TableInfo tableInfo) {
+        if (apiVersion < 1
+                && KvValueLayout.fromTableConfig(tableInfo.getTableConfig()).hasValueTag()) {
+            throw new UnsupportedVersionException(
+                    String.format(
+                            "Client API version %d cannot read tagged KV snapshots for table '%s'. "
+                                    + "Please upgrade your Fluss client to a newer version.",
+                            apiVersion, tableInfo.getTablePath()));
         }
     }
 
@@ -486,6 +504,8 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
         } else {
             partitionRegistrations = metadataManager.listPartitions(tablePath);
         }
+        // TODO: Return the actual lake partitions instead of the internal historical partition.
+        partitionRegistrations.remove(HISTORICAL_PARTITION_VALUE);
         TableInfo tableInfo = metadataManager.getTable(tablePath);
         List<String> partitionKeys = tableInfo.getPartitionKeys();
         return CompletableFuture.completedFuture(

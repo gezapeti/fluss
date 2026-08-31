@@ -255,6 +255,33 @@ ALTER TABLE MyTable ADD (
 );
 ```
 
+:::note
+For tables with `'table.datalake.enabled' = 'true'` on a Paimon or Iceberg lakehouse, Fluss also applies the added columns to the corresponding lake table as part of the `ALTER TABLE` statement, keeping both schemas in sync. Adding columns to datalake-enabled Hudi and Lance tables is not yet supported. Never add columns to the lake table directly through an external engine, since a lake table schema that diverges from the Fluss table schema stops the tiering service. See [Schema Evolution](../streaming-lakehouse/datalake-formats/paimon.md#schema-evolution) for details.
+:::
+
+### Add watermark
+
+Assuming that `my_table` already contains a timestamp column named `ts`, the following SQL adds a watermark with strategy `ts - INTERVAL '10' SECOND`. The `ts` column is then used as the event-time attribute of the table.
+
+```sql title="Flink SQL"
+ALTER TABLE my_table ADD WATERMARK FOR ts AS ts - INTERVAL '10' SECOND;
+```
+
+### Drop watermark
+
+The following SQL drops the watermark of table `my_table`.
+
+```sql title="Flink SQL"
+ALTER TABLE my_table DROP WATERMARK;
+```
+
+### Modify watermark
+
+The following SQL modifies the watermark strategy to `ts - INTERVAL '20' SECOND`.
+
+```sql title="Flink SQL"
+ALTER TABLE my_table MODIFY WATERMARK FOR ts AS ts - INTERVAL '20' SECOND;
+```
 
 ### SET properties
 The SET statement allows users to configure one or more connector options including the [Storage Options](engine-flink/options.md#storage-options) for a specified table. If a particular option is already configured on the table, it will be overridden with the new value.
@@ -265,6 +292,7 @@ When using SET to modify [Storage Options](engine-flink/options.md#storage-optio
 - All [Read Options](engine-flink/options.md#read-options), [Write Options](engine-flink/options.md#write-options), [Lookup Options](engine-flink/options.md#lookup-options) and [Other Options](engine-flink/options.md#other-options) except `bootstrap.servers`.
 - The following [Storage Options](engine-flink/options.md#storage-options):
   - `table.datalake.enabled`: Enable or disable lakehouse storage for the table.
+  - `table.datalake.historical-partition.enabled`: Enable or disable historical partition lookup.
   - `table.datalake.freshness`: Set the data freshness for lakehouse storage.
   - `table.log.tiered.local-segments`: Set the number of log segments to retain locally when tiered storage is enabled.
   - `table.auto-partition.num-retention`: Set the number of historical partitions to retain for auto partitioning.
@@ -283,6 +311,7 @@ ALTER TABLE my_table SET ('table.log.tiered.local-segments' = '5');
 
 **Limits**
 - If lakehouse storage (`table.datalake.enabled`) is already enabled for a table, options with lakehouse format prefixes (e.g., `paimon.*`) cannot be modified again.
+- After changing `table.datalake.historical-partition.enabled`, restart existing lookup jobs that need to look up historical partition data so that their clients load the updated table configuration.
 
 
 ### RESET properties

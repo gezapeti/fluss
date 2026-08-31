@@ -24,13 +24,17 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
+import org.apache.fluss.exception.HistoricalPartitionThrottledException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
+import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
+import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.exception.UnsupportedVersionException;
@@ -43,6 +47,8 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.MetricGroup;
+import org.apache.fluss.plugin.PluginManager;
+import org.apache.fluss.record.DefaultKvRecordBatch;
 import org.apache.fluss.record.KeyRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.MemoryLogRecords;
@@ -70,11 +76,13 @@ import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.LakeBucketOffset;
+import org.apache.fluss.server.entity.LookupDataForBucket;
 import org.apache.fluss.server.entity.NotifyKvSnapshotOffsetData;
 import org.apache.fluss.server.entity.NotifyLakeTableOffsetData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
 import org.apache.fluss.server.entity.NotifyRemoteLogOffsetsData;
+import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.entity.UserContext;
@@ -107,12 +115,14 @@ import org.apache.fluss.server.replica.delay.DelayedTableBucketKey;
 import org.apache.fluss.server.replica.delay.DelayedWrite;
 import org.apache.fluss.server.replica.fetcher.InitialFetchStatus;
 import org.apache.fluss.server.replica.fetcher.ReplicaFetcherManager;
+import org.apache.fluss.server.replica.historical.HistoricalPartitionManager;
 import org.apache.fluss.server.storage.DiskUsageMonitor;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.clock.Clock;
@@ -131,6 +141,7 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -138,9 +149,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -159,6 +172,15 @@ public class ReplicaManager implements ServerReconfigurable {
     private static final Logger LOG = LoggerFactory.getLogger(ReplicaManager.class);
 
     public static final String HIGH_WATERMARK_CHECKPOINT_FILE_NAME = "high-watermark-checkpoint";
+
+    /**
+     * The first PUT_KV API version whose clients understand the {@link
+     * Errors#STORAGE_BACKPRESSURE_EXCEPTION} error code (72). Rejections for older versions are
+     * downgraded to the retriable {@link Errors#KV_STORAGE_EXCEPTION} to keep rolling upgrades
+     * safe.
+     */
+    private static final short PUT_KV_VERSION_WITH_STORAGE_BACKPRESSURE = 2;
+
     private final Configuration conf;
     private final Scheduler scheduler;
     private final LogManager logManager;
@@ -218,6 +240,8 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private final ScannerManager scannerManager;
 
+    private final HistoricalPartitionManager historicalPartitionManager;
+
     public ReplicaManager(
             Configuration conf,
             Scheduler scheduler,
@@ -235,7 +259,8 @@ public class ReplicaManager implements ServerReconfigurable {
             ScannerManager scannerManager,
             Clock clock,
             ExecutorService ioExecutor,
-            LocalDiskManager localDiskManager)
+            LocalDiskManager localDiskManager,
+            @Nullable PluginManager pluginManager)
             throws IOException {
         this(
                 conf,
@@ -262,7 +287,8 @@ public class ReplicaManager implements ServerReconfigurable {
                 scannerManager,
                 clock,
                 ioExecutor,
-                localDiskManager);
+                localDiskManager,
+                pluginManager);
     }
 
     @VisibleForTesting
@@ -284,7 +310,8 @@ public class ReplicaManager implements ServerReconfigurable {
             ScannerManager scannerManager,
             Clock clock,
             ExecutorService ioExecutor,
-            LocalDiskManager localDiskManager)
+            LocalDiskManager localDiskManager,
+            @Nullable PluginManager pluginManager)
             throws IOException {
         this.conf = conf;
         this.zkClient = zkClient;
@@ -336,11 +363,24 @@ public class ReplicaManager implements ServerReconfigurable {
         this.ioExecutor = ioExecutor;
         this.minInSyncReplicas = conf.get(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER);
         this.scannerManager = checkNotNull(scannerManager, "scannerManager");
+        // Historical lookup cache capacity currently uses only the first data volume.
+        File dataDir = localDiskManager.dataDirs().get(0);
+        long dataDirVolumeBytes = Files.getFileStore(dataDir.toPath()).getTotalSpace();
+        this.historicalPartitionManager =
+                new HistoricalPartitionManager(
+                        conf,
+                        pluginManager,
+                        localDiskManager,
+                        dataDir,
+                        dataDirVolumeBytes,
+                        scheduler);
 
         registerMetrics();
     }
 
     public void startup() {
+        historicalPartitionManager.startup(scheduler);
+
         // start up ISR expiration thread.
         // A follower can log behind leader for up tp configOptions#LOG_REPLICA_MAX_LAG_TIME x 1.5
         // before it is removed from ISR.
@@ -390,6 +430,7 @@ public class ReplicaManager implements ServerReconfigurable {
 
     @Override
     public void reconfigure(Configuration newConfig) {
+        historicalPartitionManager.reconfigure(newConfig);
         int newMinInSyncReplicas =
                 newConfig.get(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER);
         if (newMinInSyncReplicas == minInSyncReplicas) {
@@ -406,6 +447,21 @@ public class ReplicaManager implements ServerReconfigurable {
     }
 
     private void registerMetrics() {
+        // for historical lookup metrics
+        MetricGroup historicalMetrics = serverMetricGroup.addGroup("historical");
+        historicalMetrics.gauge(
+                MetricNames.HISTORICAL_INFLIGHT_REQUESTS,
+                historicalPartitionManager::numInflightRequests);
+        historicalMetrics.gauge(
+                MetricNames.HISTORICAL_LOOKUP_CACHE_DISK_SIZE,
+                historicalPartitionManager::lookupCacheDiskSize);
+        historicalMetrics.gauge(
+                MetricNames.HISTORICAL_LOOKUP_CACHE_TABLE_COUNT,
+                historicalPartitionManager::cachedTableCount);
+        historicalMetrics.counter(
+                MetricNames.HISTORICAL_LOOKUP_CACHE_CAPACITY_EVICTIONS,
+                historicalPartitionManager.capacityEvictions());
+
         serverMetricGroup.gauge(
                 MetricNames.REPLICA_LEADER_COUNT,
                 () -> onlineReplicas().filter(Replica::isLeader).count());
@@ -557,31 +613,26 @@ public class ReplicaManager implements ServerReconfigurable {
                 () -> {
                     // check or apply coordinator epoch.
                     validateAndApplyCoordinatorEpoch(coordinatorEpoch, "updateMetadataCache");
-                    metadataCache.updateClusterMetadata(clusterMetadata);
-                    updateReplicaTableConfig(clusterMetadata);
+                    Set<Long> deletedTableIds =
+                            metadataCache.updateClusterMetadata(clusterMetadata);
+                    updateReplicaTableInfo(clusterMetadata);
+                    if (!deletedTableIds.isEmpty()) {
+                        ioExecutor.execute(
+                                () ->
+                                        deletedTableIds.forEach(
+                                                historicalPartitionManager
+                                                        ::invalidateTableLookuper));
+                    }
                 });
     }
 
-    private void updateReplicaTableConfig(ClusterMetadata clusterMetadata) {
-        Map<Long, Boolean> tableIdToLakeFlag = new HashMap<>();
-        Map<Long, Integer> tableIdToTieredLogLocalSegments = new HashMap<>();
-
+    private void updateReplicaTableInfo(ClusterMetadata clusterMetadata) {
+        Map<Long, TableInfo> tableInfosById = new HashMap<>();
         for (TableMetadata tableMetadata : clusterMetadata.getTableMetadataList()) {
             TableInfo tableInfo = tableMetadata.getTableInfo();
-            long tableId = tableInfo.getTableId();
-
-            // Collect datalake enabled configuration
-            if (tableInfo.getTableConfig().getDataLakeFormat().isPresent()) {
-                boolean dataLakeEnabled = tableInfo.getTableConfig().isDataLakeEnabled();
-                tableIdToLakeFlag.put(tableId, dataLakeEnabled);
-            }
-
-            // Collect tiered log local segments configuration
-            int tieredLogLocalSegments = tableInfo.getTableConfig().getTieredLogLocalSegments();
-            tableIdToTieredLogLocalSegments.put(tableId, tieredLogLocalSegments);
+            tableInfosById.put(tableInfo.getTableId(), tableInfo);
         }
-
-        if (tableIdToLakeFlag.isEmpty() && tableIdToTieredLogLocalSegments.isEmpty()) {
+        if (tableInfosById.isEmpty()) {
             return;
         }
 
@@ -590,16 +641,9 @@ public class ReplicaManager implements ServerReconfigurable {
             if (hostedReplica instanceof OnlineReplica) {
                 Replica replica = ((OnlineReplica) hostedReplica).getReplica();
                 long tableId = replica.getTableBucket().getTableId();
-
-                // Update datalake enabled configuration
-                if (tableIdToLakeFlag.containsKey(tableId)) {
-                    replica.updateIsDataLakeEnabled(tableIdToLakeFlag.get(tableId));
-                }
-
-                // Update tiered log local segments configuration
-                if (tableIdToTieredLogLocalSegments.containsKey(tableId)) {
-                    replica.updateTieredLogLocalSegments(
-                            tableIdToTieredLogLocalSegments.get(tableId));
+                TableInfo tableInfo = tableInfosById.get(tableId);
+                if (tableInfo != null) {
+                    replica.updateTableInfo(tableInfo);
                 }
             }
         }
@@ -701,6 +745,118 @@ public class ReplicaManager implements ServerReconfigurable {
                 timeoutMs, requiredAcks, entriesPerBucket.size(), kvPutResult, responseCallback);
     }
 
+    /** Puts records to historical partition leaders. */
+    public void putHistoricalRecordsToKv(
+            int timeoutMs,
+            int requiredAcks,
+            Collection<PutKvDataForBucket> entriesPerBucket,
+            @Nullable int[] targetColumns,
+            MergeMode mergeMode,
+            short apiVersion,
+            Consumer<List<PutKvResultForBucket>> responseCallback) {
+        if (isRequiredAcksInvalid(requiredAcks)) {
+            throw new InvalidRequiredAcksException("Invalid required acks: " + requiredAcks);
+        }
+        localDiskManager.ensureWritable();
+
+        if (entriesPerBucket.isEmpty()) {
+            responseCallback.accept(Collections.emptyList());
+            return;
+        }
+
+        List<PutKvResultForBucket> results = Collections.synchronizedList(new ArrayList<>());
+        AtomicInteger remaining = new AtomicInteger(entriesPerBucket.size());
+        entriesPerBucket.forEach(
+                putData ->
+                        historicalPutKv(putData, targetColumns, mergeMode, requiredAcks, apiVersion)
+                                .whenComplete(
+                                        (result, error) -> {
+                                            PutKvResultForBucket completedResult =
+                                                    error == null
+                                                            ? result
+                                                            : PutKvResultForBucket
+                                                                    .historicalFailure(
+                                                                            putData.tableBucket(),
+                                                                            ApiError.fromThrowable(
+                                                                                    error),
+                                                                            putData
+                                                                                    .originalPartitionName());
+                                            maybeAddDelayedWrite(
+                                                    timeoutMs,
+                                                    requiredAcks,
+                                                    1,
+                                                    Collections.singletonMap(
+                                                            putData.tableBucket(), completedResult),
+                                                    delayedResult -> {
+                                                        results.add(delayedResult.get(0));
+                                                        if (remaining.decrementAndGet() == 0) {
+                                                            responseCallback.accept(
+                                                                    new ArrayList<>(results));
+                                                        }
+                                                    });
+                                        }));
+    }
+
+    private CompletableFuture<PutKvResultForBucket> historicalPutKv(
+            PutKvDataForBucket putData,
+            @Nullable int[] targetColumns,
+            MergeMode mergeMode,
+            int requiredAcks,
+            short apiVersion) {
+        TableMetricGroup tableMetrics = null;
+        try {
+            Replica replica = getReplicaOrException(putData.tableBucket());
+            tableMetrics = replica.tableMetrics();
+            tableMetrics.totalHistoricalPutKvRequests().inc();
+            if (!replica.isKvTable()) {
+                throw new NonPrimaryKeyTableException(
+                        "Historical writes are only supported for primary key tables.");
+            }
+            if (!replica.isHistoricalPartition()) {
+                throw new InvalidPartitionException(
+                        "Historical write request must target a historical partition.");
+            }
+            validateClientVersionForPkTable(apiVersion, replica.getTableInfo());
+
+            KvRecordBatch records = putData.records();
+            checkArgument(
+                    records instanceof DefaultKvRecordBatch,
+                    "Historical RPC write requires DefaultKvRecordBatch, but found %s.",
+                    records.getClass().getName());
+            PutKvDataForBucket copiedData =
+                    new PutKvDataForBucket(
+                            putData.tableBucket(),
+                            copyToHeap((DefaultKvRecordBatch) records),
+                            putData.originalPartitionName());
+            TableMetricGroup historicalPutMetrics = tableMetrics;
+            return historicalPartitionManager
+                    .putKv(replica, copiedData, targetColumns, mergeMode, requiredAcks)
+                    .thenApply(
+                            result -> {
+                                if (result.failed()
+                                        && isUnexpectedHistoricalException(
+                                                result.getError().exception())) {
+                                    historicalPutMetrics.failedHistoricalPutKvRequests().inc();
+                                }
+                                return result;
+                            });
+        } catch (Throwable t) {
+            ApiError error = ApiError.fromThrowable(t);
+            if (tableMetrics != null && isUnexpectedHistoricalException(error.exception())) {
+                tableMetrics.failedHistoricalPutKvRequests().inc();
+            }
+            return CompletableFuture.completedFuture(
+                    PutKvResultForBucket.historicalFailure(
+                            putData.tableBucket(), error, putData.originalPartitionName()));
+        }
+    }
+
+    private static DefaultKvRecordBatch copyToHeap(DefaultKvRecordBatch records) {
+        byte[] bytes = new byte[records.sizeInBytes()];
+        records.getMemorySegment().get(records.getPosition(), bytes);
+        return DefaultKvRecordBatch.pointToBytes(bytes);
+    }
+
     /** Context for tracking missing keys that need to be inserted. */
     public static class MissingKeysContext {
         final List<Integer> missingIndexes;
@@ -731,7 +887,7 @@ public class ReplicaManager implements ServerReconfigurable {
             List<Integer> missingIndexes = new ArrayList<>();
             List<byte[]> missingKeys = new ArrayList<>();
             List<byte[]> requestedKeys = entry.getValue();
-            List<byte[]> lookupValues = lookupResult.lookupValues();
+            List<ByteArraySlice> lookupValues = lookupResult.lookupValues();
 
             for (int i = 0; i < requestedKeys.size(); i++) {
                 if (lookupValues.get(i) == null) {
@@ -758,13 +914,14 @@ public class ReplicaManager implements ServerReconfigurable {
                 ApiKeys.LOOKUP.highestSupportedVersion,
                 multiLookupResponseCallBack -> {
                     LookupResultForBucket result = multiLookupResponseCallBack.get(tableBucket);
-                    List<byte[]> values = result.lookupValues();
+                    List<ByteArraySlice> values = result.lookupValues();
                     checkState(
                             values.size() == 1,
                             "The result value for single lookup should be with size 1, "
                                     + "but the result size is {}",
                             values.size());
-                    responseCallback.accept(values.get(0));
+                    ByteArraySlice value = values.get(0);
+                    responseCallback.accept(value == null ? null : value.toByteArray());
                 });
     }
 
@@ -773,6 +930,70 @@ public class ReplicaManager implements ServerReconfigurable {
             short apiVersion,
             Consumer<Map<TableBucket, LookupResultForBucket>> responseCallback) {
         lookups(false, null, null, entriesPerBucket, apiVersion, responseCallback);
+    }
+
+    /** Lookup historical lake data for requests that carry original partition names. */
+    public void historicalLookups(
+            List<LookupDataForBucket> lookupData,
+            Consumer<List<LookupResultForBucket>> responseCallback) {
+        if (lookupData.isEmpty()) {
+            responseCallback.accept(Collections.emptyList());
+            return;
+        }
+
+        List<LookupResultForBucket> result =
+                Collections.synchronizedList(new ArrayList<>(lookupData.size()));
+        AtomicInteger remainingLookups = new AtomicInteger(lookupData.size());
+        for (LookupDataForBucket data : lookupData) {
+            Replica replica;
+            CompletableFuture<LookupResultForBucket> lookupFuture;
+            try {
+                replica = getReplicaOrException(data.tableBucket());
+                replica.tableMetrics().totalHistoricalLookupRequests().inc();
+                if (!replica.isKvTable()) {
+                    throw new NonPrimaryKeyTableException(
+                            "Historical lookup is only supported for primary key tables, but "
+                                    + replica.getTablePath()
+                                    + " is not a primary key table.");
+                }
+                if (!replica.isHistoricalPartition()) {
+                    throw new InvalidPartitionException(
+                            "Historical lookup request must target a historical partition.");
+                }
+                lookupFuture =
+                        historicalPartitionManager.lookup(
+                                replica, data, replica.tableMetrics()::recordHistoricalLakeLookup);
+            } catch (Exception e) {
+                result.add(
+                        new LookupResultForBucket(
+                                data.tableBucket(),
+                                data.originalPartitionName(),
+                                ApiError.fromThrowable(e)));
+                if (remainingLookups.decrementAndGet() == 0) {
+                    responseCallback.accept(result);
+                }
+                continue;
+            }
+            lookupFuture.whenComplete(
+                    (bucketResult, error) -> {
+                        LookupResultForBucket completedResult =
+                                error == null
+                                        ? bucketResult
+                                        : new LookupResultForBucket(
+                                                data.tableBucket(),
+                                                data.originalPartitionName(),
+                                                ApiError.fromThrowable(error));
+                        if (completedResult.failed()
+                                && isUnexpectedHistoricalException(
+                                        completedResult.getError().exception())) {
+                            replica.tableMetrics().failedHistoricalLookupRequests().inc();
+                        }
+                        result.add(completedResult);
+                        if (remainingLookups.decrementAndGet() == 0) {
+                            responseCallback.accept(result);
+                        }
+                    });
+        }
     }
 
     /**
@@ -891,8 +1112,12 @@ public class ReplicaManager implements ServerReconfigurable {
                 continue; // Skip buckets that failed during insert
             }
             MissingKeysContext missingKeysContext = entry.getValue();
-            List<byte[]> results =
-                    getReplicaOrException(tb).lookups(missingKeysContext.missingKeys);
+            // Read through the pre-write buffer: with acks != -1 the response (and thus this
+            // re-lookup) can run before the asynchronous flush has materialized the insert into
+            // RocksDB, but the inserted entries are already visible in the pre-write buffer.
+            Replica replica = getReplicaOrException(tb);
+            List<ByteArraySlice> results =
+                    replica.lookupsFromBufferOrKv(missingKeysContext.missingKeys);
             LookupResultForBucket lookupResult = lookupResultForBucketMap.get(tb);
             for (int i = 0; i < missingKeysContext.missingIndexes.size(); i++) {
                 lookupResult
@@ -917,14 +1142,14 @@ public class ReplicaManager implements ServerReconfigurable {
         Map<TableBucket, PrefixLookupResultForBucket> result = new HashMap<>();
         for (Map.Entry<TableBucket, List<byte[]>> entry : entriesPerBucket.entrySet()) {
             TableBucket tb = entry.getKey();
-            List<List<byte[]>> resultForBucket = new ArrayList<>();
+            List<List<ByteArraySlice>> resultForBucket = new ArrayList<>();
             try {
                 Replica replica = getReplicaOrException(tb);
                 validateClientVersionForPkTable(apiVersion, replica.getTableInfo());
                 tableMetrics = replica.tableMetrics();
                 tableMetrics.totalPrefixLookupRequests().inc();
                 for (byte[] prefixKey : entry.getValue()) {
-                    List<byte[]> resultForPerKey = replica.prefixLookup(prefixKey);
+                    List<ByteArraySlice> resultForPerKey = replica.prefixLookup(prefixKey);
                     resultForBucket.add(resultForPerKey);
                 }
                 result.put(tb, new PrefixLookupResultForBucket(tb, resultForBucket));
@@ -965,6 +1190,7 @@ public class ReplicaManager implements ServerReconfigurable {
             List<StopReplicaData> stopReplicaDataList,
             Consumer<List<StopReplicaResultForBucket>> responseCallback) {
         List<StopReplicaResultForBucket> result = new ArrayList<>();
+        Set<Long> deletedHistoricalPartitionTableIds = new HashSet<>();
         inLock(
                 replicaStateChangeLock,
                 () -> {
@@ -1026,6 +1252,9 @@ public class ReplicaManager implements ServerReconfigurable {
                                                 errorMessage));
                             } else {
                                 try {
+                                    boolean deletingHistoricalPartition =
+                                            data.isDeleteRemote()
+                                                    && replica.isHistoricalPartition();
                                     result.add(
                                             stopReplica(
                                                     tb,
@@ -1033,6 +1262,9 @@ public class ReplicaManager implements ServerReconfigurable {
                                                     data.isDeleteRemote(),
                                                     deletedTableIds,
                                                     deletedPartitionIds));
+                                    if (deletingHistoricalPartition) {
+                                        deletedHistoricalPartitionTableIds.add(tb.getTableId());
+                                    }
                                 } catch (Exception e) {
                                     LOG.error(
                                             "Error processing stopReplica operation on hostedReplica {}",
@@ -1053,6 +1285,8 @@ public class ReplicaManager implements ServerReconfigurable {
                             (id, dir) -> dropEmptyTableOrPartitionDir(dir, id, "table"));
                 });
 
+        deletedHistoricalPartitionTableIds.forEach(
+                historicalPartitionManager::invalidateTableLookuper);
         responseCallback.accept(result);
     }
 
@@ -1070,6 +1304,8 @@ public class ReplicaManager implements ServerReconfigurable {
                     // remote.
                     TableBucket tb = notifyRemoteLogOffsetsData.getTableBucket();
                     LogTablet logTablet = getReplicaOrException(tb).getLogTablet();
+                    logTablet.updateHighestCopiedEndOffset(
+                            notifyRemoteLogOffsetsData.getHighestCopiedEndOffset());
                     logTablet.updateRemoteLogStartOffset(
                             notifyRemoteLogOffsetsData.getRemoteLogStartOffset());
                     logTablet.updateRemoteLogEndOffset(
@@ -1160,10 +1396,13 @@ public class ReplicaManager implements ServerReconfigurable {
                 // register replica to remote log manager first.
                 remoteLogManager.registerReplica(replica);
 
-                replica.makeLeader(data);
+                // Load the latest lake progress before leader activation. Historical KV recovery
+                // requires its lake log end offset, while failures remain best effort for normal
+                // replicas.
                 if (replica.isDataLakeEnabled()) {
                     updateWithLakeTableSnapshot(replica);
                 }
+                replica.makeLeader(data);
 
                 // start the remote log tiering tasks for leaders
                 remoteLogManager.startLogTiering(replica);
@@ -1179,15 +1418,35 @@ public class ReplicaManager implements ServerReconfigurable {
     // NOTE: This method can be removed when fetchFromLake is deprecated
     private void updateWithLakeTableSnapshot(Replica replica) throws Exception {
         TableBucket tb = replica.getTableBucket();
-        Optional<LakeTableSnapshot> optLakeTableSnapshot =
-                zkClient.getLakeTableSnapshot(replica.getTableBucket().getTableId(), null);
-        if (optLakeTableSnapshot.isPresent()) {
-            LakeTableSnapshot lakeTableSnapshot = optLakeTableSnapshot.get();
-            long snapshotId = optLakeTableSnapshot.get().getSnapshotId();
-            replica.getLogTablet().updateLakeTableSnapshotId(snapshotId);
-            lakeTableSnapshot
-                    .getLogEndOffset(tb)
-                    .ifPresent(replica.getLogTablet()::updateLakeLogEndOffset);
+        try {
+            Optional<LakeTableSnapshot> optLakeTableSnapshot =
+                    zkClient.getLakeTableSnapshot(replica.getTableBucket().getTableId(), null);
+            if (optLakeTableSnapshot.isPresent()) {
+                LakeTableSnapshot lakeTableSnapshot = optLakeTableSnapshot.get();
+                long snapshotId = optLakeTableSnapshot.get().getSnapshotId();
+                replica.getLogTablet().updateLakeTableSnapshotId(snapshotId);
+                if (replica.isHistoricalPartition()) {
+                    // The historical overlay will be rebuilt from this snapshot's lake offset.
+                    // Refresh a cached lookuper before it becomes the fallback for data omitted
+                    // from the rebuilt overlay.
+                    historicalPartitionManager.requireLakeSnapshot(
+                            replica.getTableBucket().getTableId(), snapshotId);
+                }
+                lakeTableSnapshot
+                        .getLogEndOffset(tb)
+                        .ifPresent(replica.getLogTablet()::updateLakeLogEndOffset);
+            }
+        } catch (Exception e) {
+            if (replica.isHistoricalPartition()) {
+                // Historical recovery uses the lake offset as its durable base and replays the
+                // retained WAL from that offset. Reject leader activation if the latest lake
+                // progress cannot be loaded, instead of rebuilding the overlay from stale state.
+                throw e;
+            }
+            // Lake commit cleanup can race with this best-effort refresh and remove the
+            // referenced offsets file. A failure only leaves the snapshot/offset state stale
+            // until the next synchronization, so it must not fail a normal leader transition.
+            LOG.warn("Failed to update replica {} with lake table snapshot.", tb, e);
         }
     }
 
@@ -1358,8 +1617,13 @@ public class ReplicaManager implements ServerReconfigurable {
                         tb,
                         appendInfo.firstOffset(),
                         appendInfo.lastOffset());
+                // Sample the piggyback backpressure pressure right after the write, so the
+                // result is immutable and both the immediate (acks != -1) and the delayed
+                // (acks == -1) response paths carry it without any post-filling.
                 putResultForBucketMap.put(
-                        tb, new PutKvResultForBucket(tb, appendInfo.lastOffset() + 1));
+                        tb,
+                        new PutKvResultForBucket(
+                                tb, appendInfo.lastOffset() + 1, replica.samplePressure()));
 
                 // metric for kv
                 tableMetrics.incKvMessageIn(entry.getValue().getRecordCount());
@@ -1368,7 +1632,29 @@ public class ReplicaManager implements ServerReconfigurable {
                 tableMetrics.incLogBytesIn(appendInfo.validBytes());
                 tableMetrics.incLogMessageIn(appendInfo.numMessages());
             } catch (Exception e) {
-                if (isUnexpectedException(e)) {
+                if (e instanceof StorageBackpressureException) {
+                    // Fluss application-layer write rejection (L0 headroom or flush budget
+                    // exceeded). This is a designed backpressure signal, not a server failure.
+                    // Increment the backpressure rejection counter; do NOT increment
+                    // failedPutKvRequests or log at ERROR level.
+                    if (tableMetrics != null) {
+                        tableMetrics.incKvBackpressureRejectedRequests();
+                    }
+                    LOG.debug("Write rejected by KV backpressure for table bucket {}", tb);
+                    if (apiVersion < PUT_KV_VERSION_WITH_STORAGE_BACKPRESSURE) {
+                        // Rolling-upgrade compatibility: pre-upgrade clients map the unknown
+                        // error code 72 to the non-retriable UNKNOWN_SERVER_ERROR and would fail
+                        // the write. Downgrade to the retriable KV_STORAGE_EXCEPTION (known since
+                        // 0.1) so their standard retry path backs off, keeping the original
+                        // message for diagnosability.
+                        putResultForBucketMap.put(
+                                tb,
+                                new PutKvResultForBucket(
+                                        tb,
+                                        new ApiError(Errors.KV_STORAGE_EXCEPTION, e.getMessage())));
+                        continue;
+                    }
+                } else if (isUnexpectedException(e)) {
                     LOG.error("Error put records to local kv on replica {}", tb, e);
                     // NOTE: Failed put requests metric is not incremented for known exceptions
                     // since it is supposed to indicate un-expected failure of a server in
@@ -1638,7 +1924,8 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private @Nullable RemoteLogFetchInfo fetchLogFromRemote(Replica replica, long fetchOffset) {
         List<RemoteLogSegment> remoteLogSegmentList =
-                remoteLogManager.relevantRemoteLogSegments(replica.getTableBucket(), fetchOffset);
+                remoteLogManager.relevantRemoteLogSegmentsForFetchV0(
+                        replica.getTableBucket(), fetchOffset);
         if (!remoteLogSegmentList.isEmpty()) {
             int firstStartPos =
                     remoteLogManager.lookupPositionForOffset(
@@ -1668,7 +1955,15 @@ public class ReplicaManager implements ServerReconfigurable {
     private boolean isUnexpectedException(Exception e) {
         return !(e instanceof UnknownTableOrBucketException
                 || e instanceof NotLeaderOrFollowerException
-                || e instanceof LogOffsetOutOfRangeException);
+                || e instanceof LogOffsetOutOfRangeException
+                || e instanceof StorageBackpressureException);
+    }
+
+    private boolean isUnexpectedHistoricalException(Exception e) {
+        return isUnexpectedException(e)
+                && !(e instanceof HistoricalPartitionThrottledException
+                        || e instanceof InvalidPartitionException
+                        || e instanceof NonPrimaryKeyTableException);
     }
 
     /**
@@ -2256,6 +2551,7 @@ public class ReplicaManager implements ServerReconfigurable {
     public void shutdown() throws InterruptedException {
         // Close the resources for snapshot kv
         kvSnapshotResource.close();
+        historicalPartitionManager.close();
         replicaFetcherManager.shutdown();
         delayedWriteManager.shutdown();
         delayedFetchLogManager.shutdown();
@@ -2264,26 +2560,25 @@ public class ReplicaManager implements ServerReconfigurable {
         checkpointHighWatermarks();
     }
 
-    private void validateClientVersionForPkTable(int apiVersion, TableInfo tableInfo) {
-        if (apiVersion > 0) {
+    /** Validates whether a client API version can access this primary-key table. */
+    public static void validateClientVersionForPkTable(int apiVersion, TableInfo tableInfo) {
+        if (apiVersion >= 1) {
             return;
         }
 
-        // in the old version
         TableConfig tableConfig = tableInfo.getTableConfig();
-        // is with datalake format
-        if (tableConfig.getDataLakeFormat().isPresent()) {
-            Optional<Integer> kvFormatVersion = tableConfig.getKvFormatVersion();
-            if (kvFormatVersion.isPresent()
-                    && kvFormatVersion.get() == KV_FORMAT_VERSION_2
-                    && !tableInfo.isDefaultBucketKey()) {
-                throw new UnsupportedVersionException(
-                        String.format(
-                                "Client API version %d is not supported for table '%s'. "
-                                        + "This table uses new key encoding strategy (kv format version %d). "
-                                        + "Please upgrade your Fluss client to a newer version.",
-                                apiVersion, tableInfo.getTablePath(), kvFormatVersion.get()));
-            }
+        Optional<Integer> kvFormatVersion = tableConfig.getKvFormatVersion();
+        if (apiVersion < 1
+                && tableConfig.getDataLakeFormat().isPresent()
+                && kvFormatVersion.isPresent()
+                && kvFormatVersion.get() == KV_FORMAT_VERSION_2
+                && !tableInfo.isDefaultBucketKey()) {
+            throw new UnsupportedVersionException(
+                    String.format(
+                            "Client API version %d is not supported for table '%s'. "
+                                    + "This table uses new key encoding strategy (kv format version %d). "
+                                    + "Please upgrade your Fluss client to a newer version.",
+                            apiVersion, tableInfo.getTablePath(), kvFormatVersion.get()));
         }
     }
 
